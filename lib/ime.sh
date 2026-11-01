@@ -421,11 +421,22 @@ def fix_source(rel: str, old: str, new: str) -> None:
 
 # The toolbar is drawn top-down: the width chevron, then the tool sections. The buttons go
 # straight under the chevron, where a thumb reaches them without covering the canvas.
-fix_source(
-    "crates/ui-egui/src/panels/toolbar.rs",
-    """            ui.add_space(4.0);
-            // Subtle violet wash at the bottom of the toolbar.""",
-    """            // Undo / Redo / Clear / Delete, within thumb's reach.
+#
+# Two source layouts are covered, and only one of them is ever present:
+#
+#  * v0.17.0 and later: the toolbar has its own file, and egui 0.37 calls the accessibility
+#    role `Role`;
+#  * v0.16.0 and earlier: the whole panels module is one file, and egui 0.36 still calls it
+#    `WidgetType`.
+#
+# `fix_source` returns without doing anything when the file is absent or the anchor has moved,
+# so the pair is safe: the build gets the buttons on whichever layout it checked out, and
+# silently goes without them on a layout neither anchor matches.
+
+ANCHOR = """            ui.add_space(4.0);
+            // Subtle violet wash at the bottom of the toolbar."""
+
+BUTTONS = """            // Undo / Redo / Clear / Delete, within thumb's reach.
             // On a tablet driven by a stylus there is no Ctrl key and no Delete key, so
             // none of these four can be typed, and a software keyboard will not open over
             // the canvas. Without them the most-used actions in the editor are unreachable.
@@ -444,7 +455,7 @@ fix_source(
                             let (r, resp) = ui.allocate_exact_size(vec2(bx / 2.0 - 1.0, 34.0), Sense::click());
                             let tint = if on && resp.hovered() { t.text } else { t.text_faint };
                             icons::paint(ui, r, icon, 18.0, tint);
-                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, on, label));
+                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::__ROLE__::Button, on, label));
                             if on && resp.clicked() {
                                 let _ = crate::menus::invoke(app, &act_ctx, cmd, json!({}));
                             }
@@ -452,9 +463,13 @@ fix_source(
                     });
                 }
             }
-            ui.add_space(4.0);
-            // Subtle violet wash at the bottom of the toolbar.""",
-)
+"""
+
+for rel, role in (
+    ("crates/ui-egui/src/panels/toolbar.rs", "Role"),
+    ("crates/ui-egui/src/panels.rs", "WidgetType"),
+):
+    fix_source(rel, ANCHOR, BUTTONS.replace("__ROLE__", role) + ANCHOR)
 
 if fixed:
     print(f"  Patched the toolbar with Undo/Redo/Clear/Delete buttons for {app}: {', '.join(fixed)}")
