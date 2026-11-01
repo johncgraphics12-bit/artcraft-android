@@ -17,13 +17,14 @@ on:
           - release
           - debug
       source_version:
-        description: 'Upstream source version'
+        # PhotoCraft is on egui 0.37 from v0.17.0; this port vendors egui 0.36, so anything
+        # newer fails to compile egui-winit (no variant `ImeResetCompleted`). v0.16.0 is the
+        # version the port's own release ships, so it is the default here.
+        # A tag or branch name is accepted as well as 'stable' and 'main'.
+        description: 'Upstream source version (tag, branch, stable or main)'
         required: false
-        default: 'stable'
-        type: choice
-        options:
-          - stable
-          - main
+        default: 'v0.16.0'
+        type: string
       create_release:
         description: 'Create a GitHub Release manually'
         required: false
@@ -59,21 +60,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # One app only: `source_version` is a single ref, and every app has its own version
+        # numbering, so one tag cannot stand for all fourteen. Add others back here when
+        # building them against their own tags.
         app:
           - photocraft
-          - vectorcraft
-          - filmcraft
-          - lightcraft
-          - pdfcraft
-          - effectcraft
-          - designcraft
-          - figcraft
-          - wordcraft
-          - soundcraft
-          - deckcraft
-          - cadcraft
-          - gridcraft
-          - subcraft
 
     steps:
       - name: Checkout repository
@@ -169,7 +160,7 @@ jobs:
         timeout-minutes: 35
         env:
           BUILD_MODE: ${{ inputs.mode || 'release' }}
-          BUILD_SOURCE: ${{ inputs.source_version || 'stable' }}
+          BUILD_SOURCE: ${{ inputs.source_version || 'v0.16.0' }}
           RUSTC_WRAPPER: sccache
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           CARGO_PROFILE_RELEASE_LTO: "thin"
