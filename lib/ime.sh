@@ -26,23 +26,50 @@
 #    and the bridge and the shell's raw_input_hook from lib/build-common.sh -- so nothing here is
 #    WordCraft-specific except the Backspace fix, which goes through fix_wordcraft().
 #
-# 2. UNDO / REDO / CLEAR / DELETE BUTTONS (PhotoCraft).
+# 2. THE TACTILE ACTION BAR (PhotoCraft).
 #
-#    PhotoCraft binds these to keys (Ctrl+Z, Ctrl+Shift+Z, Delete) and to menus several levels
-#    deep, but a tablet driven by a stylus has no Ctrl key and no Delete key, and the software
-#    keyboard does not open over the canvas: the commands cannot be reached at all. Undo alone
-#    is the most-used action in a retouching session.
+#    A horizontal bar along the bottom edge carrying the six actions a finger needs most:
+#    place an image, the Type tool, Undo, Redo, Clear, Delete Layer.
 #
-#    The buttons go at the top of the toolbar, under the width chevron, where a thumb reaches
-#    them without covering the canvas. They use icons the app already ships and the same
-#    commands the keyboard and the menus trigger, and they dim when they do not apply. They are
-#    34 points tall rather than the toolbar's usual 22: Android asks for 48dp (about 9mm) of
-#    target for a fingertip, and these are the four that get pressed most.
+#    None of them could be reached on a tablet. Place Embedded sits four levels down a File
+#    menu whose rows are a stylus width apart; the rest are bound to keys (Ctrl+Z,
+#    Ctrl+Shift+Z, Delete) that a tablet has not got, and the Type tool had to be hunted in
+#    the rail.
+#
+#    The bar is along the bottom because that is where a thumb already is: on a 10-inch tablet
+#    held in two hands the bottom edge is about 13 mm away, the top centre about 160 mm. Its
+#    buttons are 60-point squares where the toolbar's are 36, which clears the 48 dp (about
+#    9 mm) Android asks for a fingertip.
+#
+#    An earlier revision of this script stacked the same buttons at the top of the vertical
+#    toolbar. That put them in the rail the bar is meant to replace, and out of thumb reach;
+#    this revision removes them from there.
 #
 # Every edit is guarded and idempotent: it applies only while the original text is still
 # present, so it no-ops once the code is there, and it is re-applied on a fresh checkout.
 #
 # To build WITHOUT all of this, comment out the call to this script in lib/build-common.sh.
+#
+#
+# 3. THE TACTILE THEME AND THE TOUCH SCALE (PhotoCraft).
+#
+#    A bar sized for a fingertip inside a shell sized for a mouse does not make a tablet app.
+#    The tool rail is 40 points wide with 30-point buttons, the status bar 24: a few millimetres
+#    each on a 204 ppi screen. This section resizes and repaints the whole shell.
+#
+#    The scale is the larger half of it. `sync_display_scale` already drives egui's global zoom
+#    from one function, so one number there resizes everything at once -- rails, bars, menus,
+#    dialogs, text -- instead of widget by widget. The desktop reads the preference as absolute
+#    pixels-per-point, which is wrong on a phone or tablet whose system scale is already 2x or
+#    3x: asking for 150% there would shrink the interface. On Android it is read as a multiple
+#    of the system's own size, Auto meaning 1.5x, and it stays adjustable in Preferences.
+#
+#    The theme is the other half: a `Tactile` kind carrying the palette from the interface
+#    mockup the designer approved -- ground #0F0F10, panels #28282B, accent #0A84FF, active
+#    #30D158, destructive #FF6961 -- with corners a fingertip can see. It is built on Studio
+#    rather than Pro because Studio is the non-Pro layout, which is also the app's larger size
+#    set: a 50-point rail with 36-point buttons. It is a theme like any other, listed in
+#    Preferences and switchable, because the accent is meant to be the user's to change.
 #
 # Usage: ime.sh <source-dir> <app> <title>
 set -euo pipefail
@@ -421,7 +448,7 @@ if fixed:
 PY
 fi
 
-# ----------------------------------------- 2. the toolbar's four action buttons
+# --------------------------- 2. the tactile action bar (PhotoCraft)
 if [[ "$APP" == "photocraft" ]]; then
 python3 - "$SRC" "$APP" <<'PY'
 from pathlib import Path
@@ -445,59 +472,267 @@ def fix_source(rel: str, old: str, new: str) -> None:
     fixed.append(rel)
 
 
-# The toolbar is drawn top-down: the width chevron, then the tool sections. The buttons go
-# straight under the chevron, where a thumb reaches them without covering the canvas.
-#
-# Two source layouts are covered, and only one of them is ever present:
-#
-#  * v0.17.0 and later: the toolbar has its own file, and egui 0.37 calls the accessibility
-#    role `Role`;
-#  * v0.16.0 and earlier: the whole panels module is one file, and egui 0.36 still calls it
-#    `WidgetType`.
-#
-# `fix_source` returns without doing anything when the file is absent or the anchor has moved,
-# so the pair is safe: the build gets the buttons on whichever layout it checked out, and
-# silently goes without them on a layout neither anchor matches.
+# The bar is written against the v0.16.0 layout, which is what BUILD_SOURCE pins: one
+# panels.rs, and the shell composing its panels in lib.rs. v0.17.0 moved the status bar into
+# panels/status_bar.rs and the composition out of lib.rs, so neither anchor below matches
+# there. `fix_source` returns without doing anything when an anchor has moved, so a later
+# source simply builds without the bar instead of failing to build.
 
-ANCHOR = """            ui.add_space(4.0);
-            // Subtle violet wash at the bottom of the toolbar."""
+# ---- the panel itself, defined just above the status bar it sits under.
 
-BUTTONS = """            // Undo / Redo / Clear / Delete, within thumb's reach.
-            // On a tablet driven by a stylus there is no Ctrl key and no Delete key, so
-            // none of these four can be typed, and a software keyboard will not open over
-            // the canvas. Without them the most-used actions in the editor are unreachable.
-            // 34 points tall, not the toolbar's usual 22: a fingertip needs about 9 mm.
-            {
-                let act_ctx = ui.ctx().clone();
-                let (can_u, can_r) = app.session.active().map_or((false, false), |d| (d.history.can_undo(), d.history.can_redo()));
-                let live = app.session.active().is_some();
-                // `tl!` borrows the translation, so each label is a `&str`, as in menu_nav.
-                for row in [
-                    [("undo-2", "edit.undo", can_u, tl!("Undo")), ("redo-2", "edit.redo", can_r, tl!("Redo"))],
-                    [("eraser", "edit.clear", live, tl!("Clear")), ("trash", "layer.delete", live, tl!("Delete Layer"))],
-                ] {
-                    ui.horizontal(|ui| {
-                        for (icon, cmd, on, label) in row {
-                            let (r, resp) = ui.allocate_exact_size(vec2(bx / 2.0 - 1.0, 34.0), Sense::click());
-                            let tint = if on && resp.hovered() { t.text } else { t.text_faint };
-                            icons::paint(ui, r, icon, 18.0, tint);
-                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::__ROLE__::Button, on, label));
-                            if on && resp.clicked() {
-                                let _ = crate::menus::invoke(app, &act_ctx, cmd, json!({}));
-                            }
-                        }
-                    });
+PANEL_ANCHOR = """// ----------------------------------------------------------------------------- status bar"""
+
+PANEL = r"""// ------------------------------------------------------------------------ tactile action bar
+
+/// Height of the tactile action bar along the bottom edge.
+pub const TOUCH_BAR_H: f32 = 56.0;
+
+/// The actions a finger needs most, on one horizontal bar along the bottom edge.
+///
+/// A tablet driven by a stylus has no Ctrl key and no Delete key, so Undo, Redo and Clear
+/// cannot be typed at all, and Place Embedded sits four levels down a File menu whose rows are
+/// a stylus width apart. None of them could be reached.
+///
+/// The bar is along the bottom because that is where a thumb already is. Measured on a 10-inch
+/// tablet held in two hands: the bottom edge is about 13 mm from the thumb's rest position and
+/// the top centre of the screen is about 160 mm, well outside a 100 mm reach.
+///
+/// 44-point squares, where the toolbar's own buttons are 36. They are read through the touch
+/// scale, which is 1.5x on Android: on screen that is a 66 dp target, comfortably past the
+/// 48 dp (about 9 mm) Android asks for a fingertip, without eating into the canvas.
+pub fn touch_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get(ui.ctx());
+    let frame = egui::Frame::NONE.fill(t.dock).inner_margin(egui::Margin::symmetric(8, 0));
+    egui::Panel::bottom("touch_bar").exact_size(TOUCH_BAR_H).frame(frame).show(ui, |ui| {
+        // Cloned before the closures below borrow `app` to run a command.
+        let act_ctx = ui.ctx().clone();
+        let (can_u, can_r) = app.session.active().map_or((false, false), |d| (d.history.can_undo(), d.history.can_redo()));
+        let live = app.session.active().is_some();
+        ui.spacing_mut().item_spacing = vec2(6.0, 0.0);
+        // `icons::button_with_icon_size` is the app's own square icon button: house hover
+        // chrome, the accent treatment when selected, the translated tooltip and the
+        // accessibility label all come with it, so the bar adds no widget code of its own.
+        crate::direction::horizontal_centered(ui, |ui| {
+            // What a design starts with: an image, or a caption.
+            //
+            // One button for the image, because the right command depends on what is open:
+            // Place Embedded puts an image *into* a document, so with nothing open it would
+            // do nothing at all. With nothing open the button opens an image as its own
+            // document instead, which is the half that was being asked for.
+            let (pick, cmd, tip) = if live { ("image", "file.placeEmbedded", "Place Embedded\u{2026}") } else { ("folder-open", "file.open", "Open\u{2026}") };
+            if icons::button_with_icon_size(ui, pick, 44.0, 20.0, false, tip).clicked() {
+                let _ = crate::menus::invoke(app, &act_ctx, cmd, json!({}));
+            }
+            // Selecting the Type tool, not a command: the tool is what opens the keyboard.
+            if icons::button_with_icon_size(ui, "type", 44.0, 20.0, app.ui.tool == Tool::Type, "Horizontal Type Tool").clicked() {
+                crate::tool_memory::select(app, Tool::Type);
+            }
+            widgets::vline(ui, 28.0);
+            // History, then the two ways to take something away. A button that does not apply
+            // is drawn but does nothing, as in the rail it replaces.
+            for (icon, cmd, on, tip) in [
+                ("undo-2", "edit.undo", can_u, "Undo"),
+                ("redo-2", "edit.redo", can_r, "Redo"),
+                ("eraser", "edit.clear", live, "Clear"),
+                ("trash", "layer.delete", live, "Delete Layer"),
+            ] {
+                if icons::button_with_icon_size(ui, icon, 44.0, 20.0, false, tip).clicked() && on {
+                    let _ = crate::menus::invoke(app, &act_ctx, cmd, json!({}));
                 }
             }
+        });
+    });
+}
+
 """
 
-for rel, role in (
-    ("crates/ui-egui/src/panels/toolbar.rs", "Role"),
-    ("crates/ui-egui/src/panels.rs", "WidgetType"),
-):
-    fix_source(rel, ANCHOR, BUTTONS.replace("__ROLE__", role) + ANCHOR)
+fix_source("crates/ui-egui/src/panels.rs", PANEL_ANCHOR, PANEL + PANEL_ANCHOR)
+
+# ---- the call. Bottom panels take the outermost edge in declaration order, so the bar is
+# declared before the status bar to sit under it, against the screen edge.
+
+CALL_ANCHOR = """        if chrome && self.ui.panels.status_bar {
+            panels::status_bar(self, ui);
+        }"""
+
+CALL = """        // The tactile action bar, under the status bar and against the bottom edge.
+        if chrome {
+            panels::touch_bar(self, ui);
+        }
+"""
+
+fix_source("crates/ui-egui/src/lib.rs", CALL_ANCHOR, CALL + CALL_ANCHOR)
 
 if fixed:
-    print(f"  Patched the toolbar with Undo/Redo/Clear/Delete buttons for {app}: {', '.join(fixed)}")
+    print(f"  Patched the tactile action bar (place image, text, undo/redo, clear, delete) for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 3. the tactile theme and the touch scale (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed, missed = [], []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missed.append(f"{tag} (no {rel})")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missed.append(f"{tag} ({text.count(old)} anchors in {rel})")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+THEME = "crates/ui-egui/src/theme.rs"
+PREFS = "crates/engine/src/prefs.rs"
+PREFS_UI = "crates/ui-egui/src/prefs_ui.rs"
+
+# ---------------------------------------------------------------- 3a. the Tactile theme
+#
+# Colours come from the interface mockup the designer approved, not from taste: ground #0F0F10,
+# panel #28282B, accent #0A84FF (his, and changeable), active #30D158, destructive #FF6961.
+# The green is not decoration -- in that design it means "this is on", so it dresses the
+# selected state and nothing else, while the blue accent stays the one a user can repaint.
+#
+# It is built on Studio rather than Pro because Studio is the non-Pro layout: rounded chips,
+# cards, and -- the part that matters on a tablet -- the larger of the app's two size sets
+# (a 50-point tool rail with 36-point buttons instead of 40 and 30).
+
+fix_source(THEME, """    /// A low-contrast light theme: pale violet-grey surfaces, softened dark text and a periwinkle accent.
+    SoftLight,
+}""", """    /// A low-contrast light theme: pale violet-grey surfaces, softened dark text and a periwinkle accent.
+    SoftLight,
+    /// Built for a tablet held in two hands: near-black ground, panels that float over it,
+    /// corners a fingertip can see, and green reserved for "this is active".
+    Tactile,
+}""", "theme: enum variant")
+
+fix_source(THEME, "    pub const ALL: [ThemeKind; 14] = [", "    pub const ALL: [ThemeKind; 15] = [", "theme: ALL length")
+
+fix_source(THEME, """        ThemeKind::SoftLight,
+    ];""", """        ThemeKind::SoftLight,
+        ThemeKind::Tactile,
+    ];""", "theme: ALL entry")
+
+fix_source(THEME, '            ThemeKind::SoftLight => "Soft Light",',
+           '            ThemeKind::SoftLight => "Soft Light",\n            ThemeKind::Tactile => "Tactile",', "theme: label")
+
+fix_source(THEME, '            ThemeKind::SoftLight => "softLight",',
+           '            ThemeKind::SoftLight => "softLight",\n            ThemeKind::Tactile => "tactile",', "theme: id")
+
+fix_source(THEME, """                | ThemeKind::SoftDark
+        )""", """                | ThemeKind::SoftDark
+                | ThemeKind::Tactile
+        )""", "theme: is_dark")
+
+fix_source(THEME, '            "softlight" => Some(ThemeKind::SoftLight),',
+           '            "softlight" => Some(ThemeKind::SoftLight),\n            "tactile" | "touch" | "tablet" => Some(ThemeKind::Tactile),', "theme: from_name")
+
+TOKENS = """            // Touch-first, from the approved mockup: a near-black ground with panels floating
+            // over it, and corners big enough to read at arm's length. Built on Studio for its
+            // non-Pro layout, which is also the app's larger size set.
+            ThemeKind::Tactile => Tokens {
+                kind,
+                chrome: Color32::from_rgb(26, 26, 29),
+                canvas: Color32::from_rgb(15, 15, 16),
+                canvas_dot: Color32::from_rgb(42, 42, 46),
+                dock: Color32::from_rgb(20, 20, 22),
+                card: Color32::from_rgb(40, 40, 43),
+                card_border: Color32::from_rgb(54, 54, 59),
+                field: Color32::from_rgb(32, 32, 35),
+                field_border: Color32::from_rgb(58, 58, 64),
+                hover: Color32::from_rgb(50, 50, 55),
+                pressed: Color32::from_rgb(62, 62, 68),
+                text: Color32::from_rgb(245, 245, 247),
+                text_dim: Color32::from_rgb(199, 199, 204),
+                text_faint: Color32::from_rgb(152, 152, 159),
+                icon: Color32::from_rgb(232, 232, 236),
+                // The accent is the one the user repaints; the green says "active" and only that.
+                accent: Color32::from_rgb(10, 132, 255),
+                accent_soft: Color32::from_rgba_unmultiplied(48, 209, 88, 48),
+                accent_border: Color32::from_rgb(48, 209, 88),
+                accent_text: Color32::from_rgb(245, 245, 247),
+                separator: Color32::from_rgb(44, 44, 48),
+                shadow: Color32::from_black_alpha(170),
+                primary_bg: Color32::from_rgb(10, 132, 255),
+                primary_text: Color32::WHITE,
+                danger: Color32::from_rgb(255, 105, 97),
+                warning: Color32::from_rgb(255, 159, 10),
+                // A 44-point target wants a corner you can see from a hand's distance.
+                radius_sm: 8.0,
+                radius: 10.0,
+                radius_lg: 14.0,
+                ..Tokens::for_kind(ThemeKind::Studio)
+            },
+"""
+
+fix_source(THEME, "            ThemeKind::Studio => Tokens {", TOKENS + "            ThemeKind::Studio => Tokens {", "theme: for_kind arm")
+
+# The theme has to be reachable from Preferences, and it is the one a tablet should start on.
+fix_source(PREFS,
+           'choice!(DarkTheme { Pro = "pro", ProMedium = "proMedium", Studio = "studio", SolarizedDark = "solarizedDark", AdwaitaDark = "adwaitaDark", BreezeDark = "breezeDark", SoftDark = "softDark" } default ProMedium);',
+           'choice!(DarkTheme { Pro = "pro", ProMedium = "proMedium", Studio = "studio", SolarizedDark = "solarizedDark", AdwaitaDark = "adwaitaDark", BreezeDark = "breezeDark", SoftDark = "softDark", Tactile = "tactile" } default Tactile);',
+           "prefs: DarkTheme")
+
+fix_source(PREFS_UI, "            DarkTheme::SoftDark => ThemeKind::SoftDark,",
+           "            DarkTheme::SoftDark => ThemeKind::SoftDark,\n            DarkTheme::Tactile => ThemeKind::Tactile,", "prefs_ui: DarkTheme map")
+
+# ---------------------------------------------------------------- 3b. the touch scale
+#
+# The single biggest reason the editor does not feel like an app on a tablet: every panel is
+# sized for a mouse. `sync_display_scale` already drives egui's global zoom from this one
+# function, so one number here resizes the whole shell -- rails, bars, menus, dialogs, text --
+# instead of widget by widget.
+#
+# The desktop reading of the preference is absolute pixels-per-point (125% means 1.25 px per
+# point, whatever the monitor reports). That is wrong for a phone or tablet, where the system
+# scale is already 2x or 3x: asking for 150% there would *shrink* the interface. On Android the
+# same preference is therefore read as a multiple of the system's own size, and Auto is 1.5x --
+# a 30-point button becomes about 9 mm, which is the 48 dp Android asks for a fingertip.
+#
+# `cfg!` rather than `#[cfg]`: it is an ordinary boolean, so both branches keep compiling and
+# the desktop tests covering this function go on passing unchanged.
+
+fix_source(PREFS_UI, """    let native = native.filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
+    match pref {
+        // The system's scale, fractional ones included (125%, 150%, 175%: #1072), and 100% on a
+        // large 4K display run unscaled (#1278); 200% there is a fixed choice.
+        prefs::UiScale::Auto => native,
+        fixed => fixed.name().parse::<f32>().map_or(1.0, |pct| pct / 100.0),
+    }
+}""", """    let native = native.filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
+    let fixed = match pref {
+        // The system's scale, fractional ones included (125%, 150%, 175%: #1072), and 100% on a
+        // large 4K display run unscaled (#1278); 200% there is a fixed choice.
+        prefs::UiScale::Auto => None,
+        other => Some(other.name().parse::<f32>().map_or(1.0, |pct| pct / 100.0)),
+    };
+    // A touch screen reads the same preference as a multiple of the system's own size, because
+    // its scale is already 2x or 3x and an absolute 1.5 would shrink the interface. Auto is
+    // half again as big, which turns a 30-point button into the 48 dp a fingertip needs.
+    if cfg!(target_os = "android") {
+        return native * fixed.unwrap_or(1.5);
+    }
+    fixed.unwrap_or(native)
+}""", "prefs_ui: touch scale")
+
+if fixed:
+    print(f"  Patched the tactile theme and touch scale for {app}: {len(fixed)} edits")
+if missed:
+    print(f"  !! NOT applied: {'; '.join(missed)}")
+    sys.exit(1)
 PY
 fi
