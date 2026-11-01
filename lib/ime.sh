@@ -166,6 +166,45 @@ fix(
 """,
 )
 
+# Watching the keyboard's insets takes one of two shapes, because the two launcher Activities
+# are not the same file. An app WITHOUT a complete adapter (WordCraft) gets the generated
+# templates/android/SafActivity.java, which already installs a decor listener of its own and
+# offers `chainWindowInsetsListener` to share it. An app WITH a complete adapter (PhotoCraft)
+# ships its own Activity from adapters/<app>/java/, which has no such helper and installs no
+# decor listener at all, so the listener goes on the decor view directly and forwards to the
+# default implementation. Choosing on what the file actually contains, rather than on the app
+# name, keeps this right if either Activity grows or loses the helper.
+BODY = """                    boolean visible = insets.isVisible(WindowInsets.Type.ime());
+                    if (visible) {
+                        imeDismissed = false;
+                    } else if (imeWasVisible && imeWanted) {
+                        imeDismissed = true;
+                        Log.i(TAG, "the keyboard was dismissed; it returns with the next edit");
+                    }
+                    imeWasVisible = visible;"""
+
+if "chainWindowInsetsListener" in activity.read_text(errors="replace"):
+    WATCH = (
+        "            // The Activity installs the real decor listener and forwards every dispatch\n"
+        "            // here, so the two observers share one listener rather than overwriting each other.\n"
+        "            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {\n"
+        "                chainWindowInsetsListener((v, insets) -> {\n" + BODY + "\n"
+        "                    return insets;\n"
+        "                });\n"
+        "            }\n"
+    )
+else:
+    WATCH = (
+        "            // This Activity installs no decor listener of its own, so the observer goes on\n"
+        "            // the decor view directly and hands the insets to the default implementation,\n"
+        "            // which dispatches them to the child views as it would have anyway.\n"
+        "            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {\n"
+        "                window.getDecorView().setOnApplyWindowInsetsListener((v, insets) -> {\n" + BODY + "\n"
+        "                    return v.onApplyWindowInsets(insets);\n"
+        "                });\n"
+        "            }\n"
+    )
+
 fix(
     rel,
     """        Window window = getWindow();
@@ -178,23 +217,10 @@ fix(
             window.getDecorView().post(this::applyImmersiveFullscreen);
             // Watch the keyboard's own insets: when it goes away while the app still wants it,
             // the user dismissed it with the back key, and the next work on the document brings
-            // it back (see imeInteraction()). The Activity installs the real decor listener
-            // (installCaptionBarInsets) and forwards every dispatch here, so the two observers
-            // share one listener rather than overwriting each other.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                chainWindowInsetsListener((v, insets) -> {
-                    boolean visible = insets.isVisible(WindowInsets.Type.ime());
-                    if (visible) {
-                        imeDismissed = false;
-                    } else if (imeWasVisible && imeWanted) {
-                        imeDismissed = true;
-                        Log.i(TAG, "the keyboard was dismissed; it returns with the next edit");
-                    }
-                    imeWasVisible = visible;
-                    return insets;
-                });
-            }
-        }
+            // it back (see imeInteraction()).
+"""
+    + WATCH
+    + """        }
 """,
 )
 
