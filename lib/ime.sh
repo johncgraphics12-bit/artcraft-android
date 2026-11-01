@@ -1,26 +1,48 @@
 #!/usr/bin/env bash
-# The soft keyboard's return after the user dismissed it — the app-side patch.
+# Android touch and soft-keyboard patches, applied to the source at build time.
 #
-# Android takes the back key as "hide the keyboard" and tells the app nothing about it: the
-# app goes on believing the keyboard is up, so it never asks for it again, and the keyboard
-# stays down through the rest of the session — the next edit (a tap in the text, a caret moved
-# by key) goes unseen by it. The keyboard only came back with a restart.
+# Two fixes live here because this script is already called from lib/build-common.sh, so
+# adding them needs no new call: replacing this one file is the whole change.
 #
-# Two things are needed for it to come back, and neither is in the app's own code:
+# 1. THE SOFT KEYBOARD'S RETURN (WordCraft and PhotoCraft).
 #
-#  * the Activity has to *know* the keyboard was dismissed. It watches the keyboard's own
-#    window insets: a keyboard that was on and then went away while the app still wanted it
-#    was dismissed by the user;
-#  * the shell has to *report* that the document is being worked on again. It sees the edits
-#    (a pointer press, a key that is not the back key) and tells the Activity, which then
-#    asks for the keyboard again.
+#    Android takes the back key as "hide the keyboard" and tells the app nothing about it: the
+#    app goes on believing the keyboard is up, so it never asks for it again, and the keyboard
+#    stays down through the rest of the session -- the next edit (a tap in the text, a caret
+#    moved by key) goes unseen by it. The keyboard only came back with a restart.
 #
-# Only WordCraft gets this: the other apps keep the keyboard where the app puts it.
+#    Two things are needed for it to come back, and neither is in the app's own code:
+#
+#      * the Activity has to *know* the keyboard was dismissed. It watches the keyboard's own
+#        window insets: a keyboard that was on and then went away while the app still wanted it
+#        was dismissed by the user;
+#      * the shell has to *report* that the document is being worked on again. It sees the edits
+#        (a pointer press, a key that is not the back key) and tells the Activity, which then
+#        asks for the keyboard again.
+#
+#    PhotoCraft was added because its Type tool is unusable without it: a caption cannot be
+#    typed, corrected or retyped once the keyboard has gone down. Every piece is shared between
+#    the apps -- the Activity is generated for all of them from templates/android/SafActivity.java,
+#    and the bridge and the shell's raw_input_hook from lib/build-common.sh -- so nothing here is
+#    WordCraft-specific except the Backspace fix, which goes through fix_wordcraft().
+#
+# 2. UNDO / REDO / CLEAR / DELETE BUTTONS (PhotoCraft).
+#
+#    PhotoCraft binds these to keys (Ctrl+Z, Ctrl+Shift+Z, Delete) and to menus several levels
+#    deep, but a tablet driven by a stylus has no Ctrl key and no Delete key, and the software
+#    keyboard does not open over the canvas: the commands cannot be reached at all. Undo alone
+#    is the most-used action in a retouching session.
+#
+#    The buttons go at the top of the toolbar, under the width chevron, where a thumb reaches
+#    them without covering the canvas. They use icons the app already ships and the same
+#    commands the keyboard and the menus trigger, and they dim when they do not apply. They are
+#    34 points tall rather than the toolbar's usual 22: Android asks for 48dp (about 9mm) of
+#    target for a fingertip, and these are the four that get pressed most.
 #
 # Every edit is guarded and idempotent: it applies only while the original text is still
 # present, so it no-ops once the code is there, and it is re-applied on a fresh checkout.
 #
-# To test WITHOUT the patch, comment out the call to this script in lib/build-common.sh.
+# To build WITHOUT all of this, comment out the call to this script in lib/build-common.sh.
 #
 # Usage: ime.sh <source-dir> <app> <title>
 set -euo pipefail
@@ -29,10 +51,8 @@ SRC="${1:?source dir}"
 APP="${2:?app}"
 TITLE="${3:?title}"
 
-if [[ "$APP" != "wordcraft" ]]; then
-    exit 0
-fi
-
+# ------------------------------------------------------------- 1. the soft keyboard
+if [[ "$APP" == "wordcraft" || "$APP" == "photocraft" ]]; then
 python3 - "$SRC" "$APP" <<'PY'
 from pathlib import Path
 import os
@@ -68,6 +88,15 @@ def fix_source(rel: str, old: str, new: str) -> None:
         return
     path.write_text(text.replace(old, new, 1))
     fixed.append(rel)
+
+
+def fix_wordcraft(rel: str, old: str, new: str) -> None:
+    """Like `fix_source`, but only for WordCraft: `crates/ui-egui/src/keys.rs` is its own text
+    engine, which no other app has. Guarded by name rather than left to miss its anchor, so it
+    can never half-apply to an app that happens to grow a file of the same name."""
+    if app.name != "wordcraft":
+        return
+    fix_source(rel, old, new)
 
 
 # Instrumentation for work on the keyboard: every event the shell drains is logged, so a
@@ -295,7 +324,7 @@ fix(
 # So when the input method asks to erase exactly one character before a caret that is already at the
 # start of the paragraph, run that same command. Only that case: a larger count means a correction
 # whose text really does start at the paragraph start, and must not join paragraphs.
-fix_source(
+fix_wordcraft(
     "crates/ui-egui/src/keys.rs",
     """    if start == end {
         return;
@@ -318,7 +347,7 @@ fix_source(
 # Its regression test: the Backspace-at-the-start-of-a-paragraph case above, and the two cases that
 # must keep their old behaviour (the start of the story, and a correction that really starts at the
 # paragraph start).
-fix_source(
+fix_wordcraft(
     "crates/ui-egui/src/keys.rs",
     """        alt_frame(&ctx, &mut a, vec![surround(5, 5), egui::Event::Text("2".into())]);
         assert_eq!(a.session.doc.plain_text(wordcraft_doc::StoryRef::Body).trim_end(), "one\\n2\\nthree");
@@ -364,3 +393,70 @@ if os.environ.get("ARTCRAFT_IME_TRACE") == "1":
 if fixed:
     print(f"  Patched the soft keyboard for {app}: {', '.join(fixed)}")
 PY
+fi
+
+# ----------------------------------------- 2. the toolbar's four action buttons
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+
+
+def fix_source(rel: str, old: str, new: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        return
+    if old not in text or new in text or text.count(old) != 1:
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(rel)
+
+
+# The toolbar is drawn top-down: the width chevron, then the tool sections. The buttons go
+# straight under the chevron, where a thumb reaches them without covering the canvas.
+fix_source(
+    "crates/ui-egui/src/panels/toolbar.rs",
+    """            ui.add_space(4.0);
+            // Subtle violet wash at the bottom of the toolbar.""",
+    """            // Undo / Redo / Clear / Delete, within thumb's reach.
+            // On a tablet driven by a stylus there is no Ctrl key and no Delete key, so
+            // none of these four can be typed, and a software keyboard will not open over
+            // the canvas. Without them the most-used actions in the editor are unreachable.
+            // 34 points tall, not the toolbar's usual 22: a fingertip needs about 9 mm.
+            {
+                let act_ctx = ui.ctx().clone();
+                let (can_u, can_r) = app.session.active().map_or((false, false), |d| (d.history.can_undo(), d.history.can_redo()));
+                let live = app.session.active().is_some();
+                // `tl!` borrows the translation, so each label is a `&str`, as in menu_nav.
+                for row in [
+                    [("undo-2", "edit.undo", can_u, tl!("Undo")), ("redo-2", "edit.redo", can_r, tl!("Redo"))],
+                    [("eraser", "edit.clear", live, tl!("Clear")), ("trash", "layer.delete", live, tl!("Delete Layer"))],
+                ] {
+                    ui.horizontal(|ui| {
+                        for (icon, cmd, on, label) in row {
+                            let (r, resp) = ui.allocate_exact_size(vec2(bx / 2.0 - 1.0, 34.0), Sense::click());
+                            let tint = if on && resp.hovered() { t.text } else { t.text_faint };
+                            icons::paint(ui, r, icon, 18.0, tint);
+                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, on, label));
+                            if on && resp.clicked() {
+                                let _ = crate::menus::invoke(app, &act_ctx, cmd, json!({}));
+                            }
+                        }
+                    });
+                }
+            }
+            ui.add_space(4.0);
+            // Subtle violet wash at the bottom of the toolbar.""",
+)
+
+if fixed:
+    print(f"  Patched the toolbar with Undo/Redo/Clear/Delete buttons for {app}: {', '.join(fixed)}")
+PY
+fi
