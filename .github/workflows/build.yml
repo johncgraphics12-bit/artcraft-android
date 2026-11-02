@@ -80,6 +80,18 @@ jobs:
         run: |
           pip install --upgrade pillow
 
+      # The builder makes its own signing key in keys/ when there is none, and a GitHub runner
+      # starts empty every time -- so every build signed the APK with a different key, and
+      # Android refuses to update an app whose signature changed. Keeping keys/ between builds
+      # means the APK installs over the previous one instead of having to be uninstalled first.
+      # The key is constant on purpose: the first run makes the key and saves it, every later
+      # run restores that same one.
+      - name: Keep the signing key between builds
+        uses: actions/cache@v4
+        with:
+          path: keys
+          key: artcraft-signing-key-v1
+
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.11
 
