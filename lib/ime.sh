@@ -131,6 +131,21 @@
 #    undone. The canvas already dispatches double taps per tool (the polygonal and magnetic
 #    lassos close their path on one), so the selection tools get an arm below those two.
 #
+#
+# 8. GPU TILES SIZED FOR A PHONE, NOT A WORKSTATION (PhotoCraft).
+#
+#    The canvas lives on the GPU in square tiles, 8192 points a side by default -- a 256 MB RGBA
+#    texture each. That number is written for a card with its own memory. A phone or tablet GPU
+#    has none; it shares the system's.
+#
+#    On the device this was measured on (Mali-G52 MC2) a whole 3543 x 3543 document fits inside
+#    one tile, so every layer move and every filter rewrites 256 MB through shared memory, while
+#    the interface -- which never touches the canvas texture -- stays perfectly smooth. Exactly
+#    the shape of the complaint: "it lags when I move a layer or apply an effect".
+#
+#    1024 a side is 4 MB a tile: sixty-four times less to move, and still four times the longest
+#    edge most phone screens have. It remains a preference (Performance > Cache Tile Size).
+#
 # Usage: ime.sh <source-dir> <app> <title>
 set -euo pipefail
 
@@ -587,6 +602,13 @@ pub fn touch_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             if icons::button_with_icon_size(ui, "type", 44.0, 20.0, app.ui.tool == Tool::Type, "Horizontal Type Tool").clicked() {
                 crate::tool_memory::select(app, Tool::Type);
             }
+            // The two the designer asked for by name: selecting something, and resizing it.
+            if icons::button_with_icon_size(ui, "quick-selection", 44.0, 20.0, app.ui.tool == Tool::QuickSelection, "Quick Selection Tool").clicked() {
+                crate::tool_memory::select(app, Tool::QuickSelection);
+            }
+            if icons::button_with_icon_size(ui, "scaling", 44.0, 20.0, false, "Free Transform").clicked() && live {
+                let _ = crate::menus::invoke(app, &act_ctx, "edit.freeTransform", json!({}));
+            }
             widgets::vline(ui, 28.0);
             // History, then the two ways to take something away. A button that does not apply
             // is drawn but does nothing, as in the rail it replaces.
@@ -599,6 +621,12 @@ pub fn touch_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 if icons::button_with_icon_size(ui, icon, 44.0, 20.0, false, tip).clicked() && on {
                     let _ = crate::menus::invoke(app, &act_ctx, cmd, json!({}));
                 }
+            }
+            widgets::vline(ui, 28.0);
+            // Saving. On a desktop it is Ctrl+S, which a tablet has no way to press, so the work
+            // could be done and never kept.
+            if icons::button_with_icon_size(ui, "file", 44.0, 20.0, false, "Save").clicked() && live {
+                let _ = crate::menus::invoke(app, &act_ctx, "file.save", json!({}));
             }
         });
     });
@@ -1179,6 +1207,62 @@ fix_source("crates/ui-egui/src/canvas.rs", """                _ => {
 
 if fixed:
     print(f"  Patched resizable windows and the deselecting double tap for {app}: {len(fixed)} edits")
+if missed:
+    print(f"  !! NOT applied: {'; '.join(missed)}")
+    sys.exit(1)
+PY
+fi
+
+# --------------------------- 8. GPU tiles sized for a phone, not a workstation (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed, missed = [], []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missed.append(f"{tag} (no {rel})")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missed.append(f"{tag} ({text.count(old)} anchors in {rel})")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+# The canvas lives on the GPU in square tiles, 8192 points on a side by default. One such tile is
+# a 8192 x 8192 RGBA texture: 256 MB. That is a workstation's number, and it is written for a card
+# with its own memory.
+#
+# A phone or tablet GPU has none: it shares the system's. On the device this was measured on, a
+# Mali-G52 MC2, a whole 3543 x 3543 document fits inside a single tile, so every layer move and
+# every filter rewrites 256 MB through shared memory while the interface -- which never touches
+# the canvas texture -- stays perfectly smooth. That is exactly the shape of the complaint.
+#
+# 1024 points a side is 4 MB a tile, sixty-four times less to move, and it is still four times the
+# longest edge most phone screens have. It applies at the next launch, and it stays a preference:
+# Preferences > Performance > Cache Tile Size, anything from 256 to 16384.
+
+fix_source("crates/engine/src/prefs.rs", """            cache_levels: 4,
+            cache_tile_size: 8192,""", """            cache_levels: 4,
+            // A phone or tablet GPU shares the system's memory, so an 8192-point tile -- 256 MB
+            // of RGBA -- is moved whole for every layer move and every filter. 1024 is 4 MB.
+            cache_tile_size: if cfg!(target_os = "android") { 1024 } else { 8192 },""",
+           "prefs: tiles a phone GPU can carry")
+
+if fixed:
+    print(f"  Patched the GPU tile size for {app}")
 if missed:
     print(f"  !! NOT applied: {'; '.join(missed)}")
     sys.exit(1)
