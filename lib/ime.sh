@@ -71,6 +71,66 @@
 #    set: a 50-point rail with 36-point buttons. It is a theme like any other, listed in
 #    Preferences and switchable, because the accent is meant to be the user's to change.
 #
+#
+# 4. THE SOFT KEYBOARD'S BACKSPACE IN THE TYPE TOOL (PhotoCraft).
+#
+#    A caption could be typed on a tablet and never taken back. Every press added a character,
+#    none removed one, so the text only ever grew.
+#
+#    A soft keyboard has no Backspace key: it deletes through the input connection. The Activity
+#    already turns both forms Android uses for that into one `ImeEvent::DeleteSurrounding` and
+#    de-duplicates them; `ime_bridge.rs` hands it to egui. The Type tool read `Text` and `Commit`
+#    and then swallowed the rest in `Ime(_) => {}` -- the deletion with it.
+#
+#    The new arm does what the Backspace key arm does a few lines below: put the ends of the run
+#    on the caret and the anchor, then replace that run with nothing, so it is one history step
+#    on the same path as every other edit.
+#
+#
+# 5. DIALOGS THAT FIT A TABLET SCREEN (PhotoCraft).
+#
+#    New Document is the tallest dialog in the app -- a preset gallery, a saved-preset list and
+#    ten fields, laid out for a desktop window. On a tablet it runs past the bottom of the screen
+#    and takes the Create button with it, so no document can be made at all. The touch scale of
+#    section 3 makes it worse, since every row is half again as tall.
+#
+#    `dialogs.rs` already solves exactly this for filter dialogs: the body goes in a scroll area
+#    bounded to what the screen leaves after the dialog's title and buttons, so those stay put.
+#    The bound is simply applied to New Document too.
+#
+#
+# 6. DRAGGING A PANEL ONTO THE ICON RAIL (PhotoCraft).
+#
+#    The panel column never gave its width back: folding a group leaves its tab strip, and the
+#    column's own minimum is 250 points whatever is inside it -- a quarter of a tablet held in
+#    landscape, spent on strips.
+#
+#    Everything needed was already there but a destination. A group can be dragged by its tab
+#    strip or by a tab pulled off it, both end in a drop resolved against a point on screen, and
+#    `Action::Close` already takes a group out of the column -- after which `dock_panels` skips
+#    it and draws no column at all once none is left. The icon rail becomes a place to drop on:
+#    release a panel over it and it leaves the column, the rail icon standing in for it, and
+#    tapping that icon brings it back.
+#
+#    The rail's own tap is deliberately left alone, so a shown group still folds to its strip and
+#    a stray tap still cannot make a panel vanish (#129). Character gains the rail button it
+#    never had, without which it could be dropped on the rail and never recovered.
+#
+#
+# 7. RESIZABLE WINDOWS, AND THE DOUBLE TAP THAT DESELECTS (PhotoCraft).
+#
+#    `show_modal` already knew how to make a dialog resizable -- an opening size, a smallest and
+#    a largest, and egui puts a grip on it -- but only three dialogs ever asked: Preferences,
+#    Curves and the web dialog. Every other one was sized by its contents and could not be
+#    touched, New Document worst of all: the tallest dialog in the app, with its Create button
+#    below the bottom of a tablet screen. Now all of them have the grip, except the ones marked
+#    compact, which already fit anywhere. The smallest size drops from 560 x 400 -- a monitor's
+#    floor -- to something a 10-inch screen can actually reach.
+#
+#    Deselecting is Ctrl+D, and a tablet has no Ctrl key, so a selection could be made and never
+#    undone. The canvas already dispatches double taps per tool (the polygonal and magnetic
+#    lassos close their path on one), so the selection tools get an arm below those two.
+#
 # Usage: ime.sh <source-dir> <app> <title>
 set -euo pipefail
 
@@ -731,6 +791,394 @@ fix_source(PREFS_UI, """    let native = native.filter(|v| v.is_finite() && *v >
 
 if fixed:
     print(f"  Patched the tactile theme and touch scale for {app}: {len(fixed)} edits")
+if missed:
+    print(f"  !! NOT applied: {'; '.join(missed)}")
+    sys.exit(1)
+PY
+fi
+
+# --------------------------- 4. the soft keyboard's Backspace in the Type tool (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed, missed = [], []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missed.append(f"{tag} (no {rel})")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missed.append(f"{tag} ({text.count(old)} anchors in {rel})")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+# A soft keyboard has no Backspace *key*. It deletes through the input connection, and the
+# Activity already turns both forms Android uses -- `deleteSurroundingText(n, m)` and a
+# synthesised `KEYCODE_DEL` -- into one `ImeEvent::DeleteSurrounding`, de-duplicated, which
+# `ime_bridge.rs` hands to egui.
+#
+# The Type tool answered `Text` and `Commit` and then swallowed everything else in
+# `Ime(_) => {}`, deletion included. So on a tablet a caption could be typed and never taken
+# back: every press added, none removed. (This is why the text in a tester's recording only ever
+# grew: "Lorem Ipsum" -> "Lorem Ipsumdvdg" -> "Lorem Ipsumdvdgqahfhdgdg".)
+#
+# The arm below does exactly what the Backspace key arm a few lines down does: it puts the two
+# ends of the range to erase on the caret and the anchor, then replaces that range with nothing,
+# so the deletion is one history step and goes through the same path as every other edit. A live
+# selection is erased whole, as Backspace does, since that is what a keyboard means by deleting
+# while text is selected.
+#
+# `as usize` is deliberate: the counts come from egui and are only ever read as indices here, so
+# the cast costs nothing and keeps this working whatever width egui gives them.
+
+ANCHOR = "            egui::Event::Ime(_) => {}"
+
+ARM = """            // Android's Backspace arrives as a deletion through the input connection, never as a
+            // key: without this arm it fell into `Ime(_)` below and text could be typed but never
+            // erased. Same mechanics as the Backspace key arm: select the run, then replace it.
+            egui::Event::Ime(egui::ImeEvent::DeleteSurrounding { before_chars, after_chars }) => {
+                if a != b {
+                    insert(app, "");
+                } else {
+                    let from = a.saturating_sub(*before_chars as usize);
+                    let to = (a + *after_chars as usize).min(n);
+                    if from != to {
+                        if let Some(e) = app.ui.text_edit.as_mut() {
+                            e.caret = to;
+                            e.anchor = from;
+                        }
+                        insert(app, "");
+                    }
+                }
+            }
+"""
+
+fix_source("crates/ui-egui/src/type_tool.rs", ANCHOR, ARM + ANCHOR, "type_tool: DeleteSurrounding")
+
+if fixed:
+    print(f"  Patched the Type tool's soft-keyboard Backspace for {app}")
+if missed:
+    print(f"  !! NOT applied: {'; '.join(missed)}")
+    sys.exit(1)
+PY
+fi
+
+# --------------------------- 5. dialogs that fit a tablet screen (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed, missed = [], []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missed.append(f"{tag} (no {rel})")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missed.append(f"{tag} ({text.count(old)} anchors in {rel})")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+# New Document is the tallest dialog in the app: a preset gallery, a saved-preset list and ten
+# fields, laid out for a desktop window. On a tablet -- more so with the touch scale, which
+# makes every row half again as tall -- it runs past the bottom of the screen and takes the
+# Create button with it, so a new document cannot be made at all.
+#
+# `dialogs.rs` already solves this for filter dialogs, whose parameter lists are just as long:
+# the body goes in a scroll area bounded to what the screen leaves after the dialog's own title
+# and buttons, so those stay put and the content scrolls. The same bound is applied here.
+# `DIALOG_CHROME` and `ctx.content_rect()` are the file's own, already used a few arms below.
+
+ANCHOR = """                DialogKind::NewDocument => {
+                    if crate::new_doc_ui::body(app, ui, &mut fields) {
+                        outcome = Some(true);
+                    }
+                }"""
+
+BOUNDED = """                DialogKind::NewDocument => {
+                    // The tallest dialog in the app, on the shortest screen it runs on: without a
+                    // bound it pushes Create off the bottom and a document cannot be created at
+                    // all. Same treatment as the filter dialogs below, bounded to the room the
+                    // window gives it -- the body scrolls, the title and the buttons stay put,
+                    // and shrinking the window (section 7) scrolls the body instead of spilling.
+                    let room = ui.available_height().max(120.0);
+                    let created = egui::ScrollArea::vertical()
+                        .id_salt(id.with("new-document-body"))
+                        .max_height(room)
+                        .show(ui, |ui| crate::new_doc_ui::body(app, ui, &mut fields))
+                        .inner;
+                    if created {
+                        outcome = Some(true);
+                    }
+                }"""
+
+fix_source("crates/ui-egui/src/dialogs.rs", ANCHOR, BOUNDED, "dialogs: New Document fits the screen")
+
+if fixed:
+    print(f"  Patched the New Document dialog to fit the screen for {app}")
+if missed:
+    print(f"  !! NOT applied: {'; '.join(missed)}")
+    sys.exit(1)
+PY
+fi
+
+# --------------------------- 6. drag a panel onto the icon rail to free the column (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed, missed = [], []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missed.append(f"{tag} (no {rel})")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missed.append(f"{tag} ({text.count(old)} anchors in {rel})")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+D = "crates/ui-egui/src/dock.rs"
+
+# The panel column never gives its width back. Folding a group leaves its tab strip, and the
+# column's own minimum is 250 points whatever is inside it -- a quarter of a tablet held in
+# landscape, spent on strips.
+#
+# Everything needed was already here but one destination. A group can be dragged by its tab
+# strip, or by a tab pulled off it; both end in a drop resolved against a point on screen; and
+# `Action::Close` already takes a group out of the column, after which `dock_panels` skips it
+# and draws no column at all once none is left. The icon rail is simply added as a place to drop
+# on: release a panel over it and it leaves the column, its rail icon standing in for it. The
+# rail's own tap is untouched, so a shown group still folds to its strip (and a stray tap still
+# cannot make a panel vanish, #129); tapping the icon of a group that is out brings it back
+# through `reveal`, as it already did.
+#
+# The rail's rectangle comes from egui's own panel state rather than being passed down: the rail
+# is drawn by `panels.rs`, after this code runs on a tablet, and its position from the previous
+# frame is exact enough for a pointer test -- it is a fixed-width panel against the screen edge.
+
+fix_source(D, "fn drop_before(", """/// The icon rail's rectangle, while the rail is up. Taken from egui's panel state because the
+/// rail is drawn by `panels::right_dock`, not here; it is a fixed-width panel pinned to the
+/// screen edge, so the previous frame's rectangle is exact.
+fn rail_rect(ctx: &egui::Context) -> Option<Rect> {
+    egui::containers::panel::PanelState::load(ctx, egui::Id::new("rail")).map(|s| s.outer_rect)
+}
+
+/// Was a panel released over the icon rail? Dropping there sends it out of the column.
+fn dropped_on_rail(ctx: &egui::Context, p: Pos2) -> bool {
+    rail_rect(ctx).is_some_and(|r| r.contains(p))
+}
+
+fn drop_before(""", "dock: rail drop target")
+
+fix_source(D, """            actions.push(Action::Move(g, drop_before(&order, &rects, g, p.y)));
+        }""", """            // Released over the icon rail: out of the column rather than up or down it. The
+            // width goes back to the canvas and the rail icon becomes the way back.
+            if dropped_on_rail(ui.ctx(), p) {
+                actions.push(Action::Close(g));
+            } else {
+                actions.push(Action::Move(g, drop_before(&order, &rects, g, p.y)));
+            }
+        }""", "dock: a strip dropped on the rail")
+
+fix_source(D, """        } else {
+            actions.push(Action::Move(from, drop_before(&order, &rects, from, position.y)));
+        }""", """        } else if dropped_on_rail(ui.ctx(), position) {
+            // A tab pulled off its strip and dropped on the rail takes its whole group out,
+            // which is what the strip drag does: the rail stands for groups, not single tabs.
+            actions.push(Action::Close(from));
+        } else {
+            actions.push(Action::Move(from, drop_before(&order, &rects, from, position.y)));
+        }""", "dock: a tab dropped on the rail")
+
+fix_source(D, """    // Drop indicator while a group is dragged by its tab strip.
+    if let (Some(g), Some(p)) = (dragging, ui.ctx().pointer_interact_pos()) {
+        let before = drop_before(&order, &rects, g, p.y);
+        let line_y = match before.and_then(|b| rects.iter().find(|(x, _)| *x == b)) {
+            Some((_, r)) => r.top() - GAP / 2.0,
+            None => rects.last().map_or(area.top(), |(_, r)| r.bottom() + GAP / 2.0),
+        };
+        ui.painter().line_segment([pos2(area.left(), line_y), pos2(area.right(), line_y)], Stroke::new(3.0, t.accent));
+    }""", """    // Drop indicator while a group is dragged: where it would land in the column, or the rail
+    // washed in the accent when releasing there would take it out of the column instead.
+    if let (Some(g), Some(p)) = (dragging, ui.ctx().pointer_interact_pos()) {
+        if let Some(rail) = rail_rect(ui.ctx()).filter(|r| r.contains(p)) {
+            // On a foreground layer: the rail is outside this panel's clip rectangle.
+            let wash = egui::Color32::from_rgba_unmultiplied(t.accent.r(), t.accent.g(), t.accent.b(), 70);
+            let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("pc-rail-drop"));
+            ui.ctx().layer_painter(layer).rect_filled(rail, 0.0, wash);
+        } else {
+            let before = drop_before(&order, &rects, g, p.y);
+            let line_y = match before.and_then(|b| rects.iter().find(|(x, _)| *x == b)) {
+                Some((_, r)) => r.top() - GAP / 2.0,
+                None => rects.last().map_or(area.top(), |(_, r)| r.bottom() + GAP / 2.0),
+            };
+            ui.painter().line_segment([pos2(area.left(), line_y), pos2(area.right(), line_y)], Stroke::new(3.0, t.accent));
+        }
+    }""", "dock: the rail lights up as a target")
+
+# Character had no rail button, so once dropped on the rail it could never be brought back.
+fix_source("crates/ui-egui/src/panels.rs", """                let entries: [(&str, &str, Group); 6] = [
+                    ("sliders-horizontal", tl!("Properties"), Group::Properties),""",
+           """                let entries: [(&str, &str, Group); 7] = [
+                    ("sliders-horizontal", tl!("Properties"), Group::Properties),
+                    ("type", tl!("Character"), Group::Character),""",
+           "rail: the Character group")
+
+if fixed:
+    print(f"  Patched drag-a-panel-onto-the-rail for {app}: {len(fixed)} edits")
+if missed:
+    print(f"  !! NOT applied: {'; '.join(missed)}")
+    sys.exit(1)
+PY
+fi
+
+# --------------------------- 7. resizable windows, and the double tap that deselects (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed, missed = [], []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missed.append(f"{tag} (no {rel})")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missed.append(f"{tag} ({text.count(old)} anchors in {rel})")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+D = "crates/ui-egui/src/dialogs.rs"
+
+# ---- 7a. every window gets a resize grip.
+#
+# `show_modal` already knows how: given an opening size, a smallest and a largest, it wraps the
+# dialog in an `egui::Resize` with a grip. Only three dialogs ever asked for it -- Preferences,
+# Curves and the web dialog -- so every other one was sized by its contents and could not be
+# touched. New Document is the one that hurt: it is the tallest in the app, and on a tablet its
+# Create button sat below the bottom of the screen with no way to reach it.
+#
+# Dialogs marked `__compact` (a few short fields) keep hugging their contents: they already fit
+# anywhere, and a grip would only wrap them in empty room. Everything else opens roomy and can
+# be dragged to any size between the new minimum and the screen.
+
+fix_source(D, "const CURVES_SIZE: egui::Vec2 = egui::vec2(300.0, 420.0);",
+           """const CURVES_SIZE: egui::Vec2 = egui::vec2(300.0, 420.0);
+/// The size every other resizable dialog opens at, before the screen clamps it down and before
+/// the size the user last gave it takes over.
+const ROOMY_DIALOG: egui::Vec2 = egui::vec2(620.0, 480.0);""",
+           "dialogs: a roomy default size")
+
+fix_source(D, """    } else if is_curves(fields) {
+        Some(CURVES_SIZE)
+    } else {
+        None
+    }
+}""", """    } else if is_curves(fields) {
+        Some(CURVES_SIZE)
+    } else if fields.contains_key("__compact") {
+        // A few short fields: it fits anywhere already, and a grip would only add empty room.
+        None
+    } else {
+        // Everything else, New Document above all, gets a grip and a size the screen can hold.
+        Some(ROOMY_DIALOG)
+    }
+}""", "dialogs: every window resizable")
+
+fix_source(D, "    if is_curves(fields) { egui::vec2(300.0, 420.0) } else { egui::vec2(560.0, 400.0) }",
+           """    // 560 x 400 was a monitor's floor, kept so two-column layouts stayed side by side. On a
+    // tablet it is most of the screen, and a window that cannot be made small is not resizable
+    // in any way the user can feel. The body keeps its own 380-point minimum width.
+    if is_curves(fields) { egui::vec2(300.0, 420.0) } else { egui::vec2(320.0, 240.0) }""",
+           "dialogs: a floor a tablet can reach")
+
+# ---- 7b. a double tap drops the selection.
+#
+# Deselecting is Ctrl+D, and a tablet has no Ctrl key, so a selection could be made and never
+# undone. The canvas already dispatches double taps per tool -- the polygonal and magnetic
+# lassos close their path on one -- so the selection tools get an arm of their own, below those
+# two so neither loses its own meaning. `is_enabled` is the app's own test for "there is a
+# selection to drop", the same one the menu entry uses.
+
+fix_source("crates/ui-egui/src/canvas.rs", """                _ => {
+                    if tool == Tool::Move && app.ui.transform.is_none() {""",
+           """                // No Ctrl key on a tablet, so Ctrl+D cannot drop a selection: a double tap with a
+                // selection tool does it instead. The two lassos above keep theirs, which closes
+                // the path they are drawing.
+                _ if response.double_clicked()
+                    && matches!(
+                        tool,
+                        Tool::RectMarquee
+                            | Tool::EllipseMarquee
+                            | Tool::SingleRowMarquee
+                            | Tool::SingleColumnMarquee
+                            | Tool::Lasso
+                            | Tool::MagicWand
+                            | Tool::QuickSelection
+                            | Tool::ObjectSelection
+                    )
+                    && app.session.is_enabled("select.deselect") =>
+                {
+                    if let Err(e) = app.run("select.deselect", json!({})) {
+                        app.ui.status = e;
+                    }
+                }
+                _ => {
+                    if tool == Tool::Move && app.ui.transform.is_none() {""",
+           "canvas: a double tap deselects")
+
+if fixed:
+    print(f"  Patched resizable windows and the deselecting double tap for {app}: {len(fixed)} edits")
 if missed:
     print(f"  !! NOT applied: {'; '.join(missed)}")
     sys.exit(1)
