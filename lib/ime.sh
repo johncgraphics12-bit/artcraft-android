@@ -48,9 +48,6 @@
 # Every edit is guarded and idempotent: it applies only while the original text is still
 # present, so it no-ops once the code is there, and it is re-applied on a fresh checkout.
 #
-# To build WITHOUT all of this, comment out the call to this script in lib/build-common.sh.
-#
-#
 # 3. THE TACTILE THEME AND THE TOUCH SCALE (PhotoCraft).
 #
 #    A bar sized for a fingertip inside a shell sized for a mouse does not make a tablet app.
@@ -145,6 +142,80 @@
 #
 #    1024 a side is 4 MB a tile: sixty-four times less to move, and still four times the longest
 #    edge most phone screens have. It remains a preference (Performance > Cache Tile Size).
+#
+#
+# 9. THE ICON RAIL REPLACES THE DOCK, AND OPENS ITS PANELS OVER THE CANVAS (PhotoCraft).
+#
+#    On a desktop the dock is a column beside the canvas, and the icon rail shows, expands or
+#    collapses groups inside it. On a 10-inch tablet that column takes a third of the screen
+#    whatever it holds, and a group left collapsed in it is invisible until you find its
+#    chevron -- so the image is small and the panels are hard to reach at the same time.
+#
+#    Affinity and Photoshop on iPad both answer this the same way: one rail of icons, and a
+#    panel that opens *over* the image and closes again, so the canvas keeps the whole window
+#    whenever a panel is not being read.
+#
+#    That is what this does on Android, and only on Android:
+#
+#      * the dock column is not drawn at all; the rail takes its place;
+#      * the rail lists every group, not the dock rail's six -- Character (the type panel) is
+#        left out of the desktop default workspace, and a tablet has no other way to reach it --
+#        and it scrolls, so more groups can be added without running off the screen;
+#      * a tap opens a group over the canvas, a second tap on the same icon closes it. One
+#        state per group, open or closed, shown by the icon: nothing can be left half-hidden;
+#      * the panel is the docked group, tabs and all. It reuses dock_body, so Layers, Channels
+#        and Paths, Color and Swatches, History and Actions behave exactly as on the desktop,
+#        bounded and scrolled the way the dock bounds them;
+#      * Studio's floating Properties card is suppressed, since Properties is now a rail entry
+#        like every other group and the card would be a second copy of the same panel.
+#
+#    A custom workspace (Window > Workspace) draws its own destinations through panel_docking
+#    and is left alone.
+#
+#
+# 10. A SELECTION MODE THE QUICK SELECTION TOOL CAN REACH (PhotoCraft).
+#
+#    Every selection tool in PhotoCraft has four modes -- New, Add to, Subtract from, Intersect
+#    with the selection -- and every one of them except Quick Selection already shows them as
+#    buttons on its options bar. Quick Selection has only Alt, and it says so on the bar:
+#    "Alt to subtract".
+#
+#    A tablet has no Alt. So on the tool most used for cutting a subject out of a photograph,
+#    exactly half of what the tool does was out of reach -- and a clean cut-out needs both
+#    adding and taking away, which means it could not be finished at all.
+#
+#    Three buttons now sit at the head of its options bar, where Photoshop puts them, in place
+#    of the hint asking for a key that is not there. Three and not four because the engine's
+#    select.quick has no intersect mode; intersect left over from the lasso reads as Add, which
+#    is what the stroke already does with it. The state is the same selection_mode the lasso and
+#    the wand use, so the mode follows you from tool to tool, and Alt still wins when it is held,
+#    so nothing changes for a mouse and a keyboard.
+#
+#
+# 11. CHOOSE THE SAVE FORMAT INSIDE THE APP (PhotoCraft).
+#
+#    PhotoCraft writes PSD, and PSD is even its default: the exporter puts out layers, groups,
+#    layer and clipping masks, smart objects, editable text, blend modes, adjustment layers and
+#    an embedded preview, and switches to PSB by itself when the document outgrows a PSD. A save
+#    to PSD becomes the document's own file, not a flattened copy -- the code recognises only
+#    three formats as holding a whole document, and PSD is one of them.
+#
+#    But the *choice* of format is not drawn by PhotoCraft. It is the "Save as type" list at the
+#    bottom of the platform's save dialog, which PhotoCraft fills and Windows or macOS draws.
+#    Android's picker has no such list: it gives a folder and a name, and that is all. So on the
+#    tablet every save silently took whichever extension had been suggested, and PSD, PDF, JPEG,
+#    PNG, TIFF and WebP could not be asked for at all.
+#
+#    The list now lives in the app. File > Save As on Android first shows a short modal -- PSD,
+#    PhotoCraft, PDF, PNG, JPEG, TIFF, WebP, one finger-sized button each, PSD highlighted as the
+#    default -- and the folder picker opens after, with the extension already on the name.
+#
+#    The tail of the save that asks where to put the file became save_pick, so the chooser goes
+#    on through exactly the same path as a desktop save: the replace prompt, the TIFF, JPEG,
+#    Targa and DDS option prompts, the disk-change check and the action journal are all unchanged.
+#
+#
+# To build WITHOUT all of this, comment out the call to this script in lib/build-common.sh.
 #
 # Usage: ime.sh <source-dir> <app> <title>
 set -euo pipefail
@@ -1268,3 +1339,516 @@ if missed:
     sys.exit(1)
 PY
 fi
+
+# --------------------------- 9. the touch rail and its panel over the canvas (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+# ---- The rail and the panel it opens, defined just above the dock they replace.
+
+PANEL_ANCHOR = """// ----------------------------------------------------------------------------- dock"""
+
+PANEL = r"""// ---------------------------------------------------------------------- touch panels
+
+/// Width of the icon rail on a touch screen, and the side of one of its buttons.
+pub const TOUCH_RAIL_W: f32 = 56.0;
+const TOUCH_RAIL_BTN: f32 = 44.0;
+/// How wide the panel opened over the canvas is, and the most of the canvas it may cover.
+const TOUCH_PANEL_W: f32 = 340.0;
+const TOUCH_PANEL_SHARE: f32 = 0.64;
+/// Height of the panel's header: its tab strip and its close box.
+const TOUCH_HEAD_H: f32 = 36.0;
+
+fn touch_open_id() -> egui::Id {
+    egui::Id::new("touch-open-group")
+}
+
+/// The panel group open over the canvas, if any.
+pub(crate) fn touch_open(ctx: &egui::Context) -> Option<crate::dock::Group> {
+    ctx.data(|d| d.get_temp::<Option<crate::dock::Group>>(touch_open_id())).flatten()
+}
+
+fn set_touch_open(ctx: &egui::Context, g: Option<crate::dock::Group>) {
+    ctx.data_mut(|d| d.insert_temp(touch_open_id(), g));
+}
+
+/// The icon rail on a touch screen: every panel group, scrollable, and nothing docked beside the
+/// canvas. A tap opens a group over the image (`touch_panel`), a second tap on the same icon
+/// closes it, so the whole window is the image the rest of the time.
+///
+/// The dock's own rail toggles a column that eats a third of a tablet screen, and a group left
+/// collapsed there is invisible until you find its chevron (#129). Here there is one state per
+/// group, open or closed, and the icon shows which.
+pub fn touch_rail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get(ui.ctx());
+    let open = touch_open(ui.ctx());
+    crate::direction::end_panel("rail")
+        .resizable(false)
+        .exact_size(TOUCH_RAIL_W)
+        .frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(6, 8)))
+        .show(ui, |ui| {
+            // The separator is on the canvas side.
+            let r = ui.max_rect();
+            let x = if crate::direction::is_rtl() { r.right() + 6.0 } else { r.left() - 6.0 };
+            ui.painter().line_segment([pos2(x, r.top() - 8.0), pos2(x, r.bottom() + 8.0)], Stroke::new(1.0, t.separator));
+            ui.spacing_mut().item_spacing.y = 6.0;
+            use crate::dock::Group;
+            // Every group, not the dock rail's six: Character is the type panel, which the dock
+            // leaves out of the default workspace and a tablet has no other way of reaching.
+            let entries: [(&str, &str, Group); 7] = [
+                ("layers", tl!("Layers"), Group::Layers),
+                ("sliders-horizontal", tl!("Properties"), Group::Properties),
+                ("palette", tl!("Color & Swatches"), Group::Color),
+                ("type", tl!("Character"), Group::Character),
+                ("clock", tl!("History"), Group::History),
+                ("navigation", tl!("Navigator"), Group::Navigator),
+                ("brush", tl!("Brushes"), Group::Brushes),
+            ];
+            egui::ScrollArea::vertical().id_salt("touch-rail").auto_shrink([false, false]).show(ui, |ui| {
+                for (icon, name, g) in entries {
+                    if icons::rail_button(ui, icon, TOUCH_RAIL_BTN, open == Some(g), name).clicked() {
+                        if open == Some(g) {
+                            set_touch_open(ui.ctx(), None);
+                        } else {
+                            // `reveal` un-hides the group's selected tab, so a group whose tabs
+                            // were closed on a desktop still has something to show here.
+                            crate::dock::reveal(app, g);
+                            set_touch_open(ui.ctx(), Some(g));
+                        }
+                    }
+                }
+            });
+        });
+}
+
+/// The group opened from the touch rail, drawn over the canvas instead of beside it, so the image
+/// keeps the whole window. Its tab strip and its body are the docked group's (`dock_body`),
+/// bounded and scrolled the way `dock::show` bounds a docked group's.
+pub fn touch_panel(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    let Some(group) = touch_open(ctx) else { return };
+    if app.ui.docking.is_some() {
+        return;
+    }
+    let t = Tokens::get(ctx);
+    // The canvas, or the whole window before a document has been laid out in it.
+    let canvas = if app.last_canvas_rect.is_positive() { app.last_canvas_rect } else { ctx.content_rect() };
+    if !canvas.is_positive() {
+        return;
+    }
+    let width = TOUCH_PANEL_W.min(canvas.width() * TOUCH_PANEL_SHARE).max(200.0);
+    let height = (canvas.height() - 20.0).max(160.0);
+    let x = if crate::direction::is_rtl() { canvas.left() + 10.0 } else { canvas.right() - width - 10.0 };
+    let frame = egui::Frame::NONE
+        .fill(t.card)
+        .stroke(Stroke::new(1.0, t.card_border))
+        .corner_radius(CornerRadius::same(t.radius_lg as u8))
+        .shadow(egui::Shadow { offset: [0, 12], blur: 36, spread: 0, color: t.shadow })
+        .inner_margin(egui::Margin::same(12));
+    // Order::Middle, like the other floating panels, so menus, popups and dialogs stay above it.
+    egui::Area::new(egui::Id::new("touch-panel")).order(egui::Order::Middle).fixed_pos(pos2(x, canvas.top() + 10.0)).show(ctx, |ui| {
+        frame.show(ui, |ui| {
+            ui.set_width(width - 24.0);
+            ui.set_height(height - 24.0);
+            let visible = app.ui.dock.visible_tabs(group, t.pro);
+            if visible.is_empty() {
+                return;
+            }
+            let indices: Vec<usize> = visible.iter().map(|(i, _)| *i).collect();
+            let tabs: Vec<&str> = visible.iter().map(|(_, name)| *name).collect();
+            let before = *group.tab_mut(&mut app.ui.dock_tabs);
+            let mut sel = indices.iter().position(|i| *i == before).unwrap_or(0);
+            // A close box a finger can hit, and the tab strip beside it.
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), TOUCH_HEAD_H), Sense::hover());
+            let shut = Rect::from_min_max(pos2(row.right() - TOUCH_HEAD_H, row.top()), row.max);
+            if icons::button(&mut ui.new_child(egui::UiBuilder::new().max_rect(shut)), "x", TOUCH_HEAD_H, false, tl!("Close")).clicked() {
+                set_touch_open(ui.ctx(), None);
+            }
+            let bar = Rect::from_min_max(row.min, pos2((shut.left() - 6.0).max(row.left()), row.bottom()));
+            let strip = crate::tab_strip::pill_tabs(ui, egui::Id::new("touch-panel-tabs"), bar, &tabs, &mut sel, false);
+            if let Some(&picked) = indices.get(sel) {
+                *group.tab_mut(&mut app.ui.dock_tabs) = picked;
+            }
+            if matches!(strip.context, Some(crate::tab_strip::TabContextAction::CloseGroup)) {
+                set_touch_open(ui.ctx(), None);
+            }
+            ui.add_space(6.0);
+            widgets::hairline(ui);
+            ui.add_space(8.0);
+            let Some(&tab) = indices.get(sel) else { return };
+            // Bounded and scrolled exactly as `dock::show` bounds a docked group's body: the
+            // tabs that lay out their own list and footer must not be nested in a scroll area.
+            let inner = ui.available_height().max(0.0);
+            if group.scrolls_itself(tab) {
+                ui.set_min_height(inner);
+                dock_body(app, ui, group, tab);
+            } else {
+                offer_color_field_fill(ui, t.pro, group, tab);
+                ui.spacing_mut().scroll.fade.strength = 0.0;
+                egui::ScrollArea::vertical()
+                    .id_salt(("touch-scroll", group.key(), tab))
+                    .max_height(inner)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| dock_body(app, ui, group, tab));
+            }
+        });
+    });
+}
+
+"""
+
+fix_source("crates/ui-egui/src/panels.rs", PANEL_ANCHOR, PANEL + PANEL_ANCHOR, "the touch rail and its panel")
+
+# ---- The rail replaces the dock on Android. A custom workspace (panel_docking) draws its own
+# destinations and is left alone.
+
+DOCK_ANCHOR = """pub fn right_dock(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    // Even legacy destinations must discard gestures captured by an earlier workspace.
+    let customized = crate::panel_docking::show(app, ui);"""
+
+DOCK = """
+    // On a touch screen nothing docks beside the canvas: the rail holds every group and opens
+    // one over the image instead (`touch_rail`, `touch_panel`).
+    if cfg!(target_os = "android") && !customized {
+        touch_rail(app, ui);
+        crate::dock::persist(app, ui.ctx());
+        return;
+    }"""
+
+fix_source("crates/ui-egui/src/panels.rs", DOCK_ANCHOR, DOCK_ANCHOR + DOCK, "the dock replaced by the rail")
+
+# ---- Studio's floating Properties card would double the rail's Properties entry.
+
+CARD_ANCHOR = """    // Pro (Photoshop) docks Properties; Studio floats it over the canvas.
+    if !app.ui.panels.properties || Tokens::get(ctx).pro {
+        return;
+    }"""
+
+CARD = """    // On a touch screen Properties is a rail entry like every other group, so the floating
+    // card would be a second copy of the same panel.
+    if cfg!(target_os = "android") {
+        return;
+    }
+"""
+
+fix_source("crates/ui-egui/src/panels.rs", CARD_ANCHOR, CARD + CARD_ANCHOR, "the floating Properties card")
+
+# ---- The panel is drawn after the canvas, over it, where the other floating panels are drawn.
+
+CALL_ANCHOR = """        panels::properties_window(self, &ctx);"""
+
+CALL = """
+        // The panel opened from the touch rail, over the canvas (Android).
+        panels::touch_panel(self, &ctx);"""
+
+fix_source("crates/ui-egui/src/lib.rs", CALL_ANCHOR, CALL_ANCHOR + CALL, "the call drawing the panel over the canvas")
+
+if missing:
+    print(f"  Could not patch the touch rail for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the touch rail for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 10. a selection mode the Quick Selection tool can reach (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+# ---- The buttons. Three, not the lasso's four: `select.quick` takes new, add and subtract, and
+# has no mode for intersect.
+
+HELPER_ANCHOR = """fn pattern_stamp_options(app: &mut PhotocraftApp, ui: &mut egui::Ui) {"""
+
+HELPER = r"""/// New / Add / Subtract for the Quick Selection tool's options bar.
+///
+/// Every other selection tool already shows these (`panels::selection_mode_buttons`); this one
+/// only had Alt, which a tablet has no key for -- so half the tool was out of reach, and a
+/// cut-out, which needs both adding and taking away, could not be finished at all. The state is
+/// `selection_mode`, shared with the lasso and the wand, so switching tools keeps the mode.
+///
+/// Three buttons, because `select.quick` has no intersect mode. Intersect left over from the
+/// lasso therefore reads as Add here, which is what the stroke does with it.
+fn quick_selection_mode_buttons(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    ui.spacing_mut().item_spacing.x = 2.0;
+    for (mode, icon, tip) in [(0u8, "square", tl!("New selection")), (1, "plus", tl!("Add to selection")), (2, "minus", tl!("Subtract from selection"))] {
+        let on = app.ui.selection_mode == mode || (mode == 1 && app.ui.selection_mode == 3);
+        if crate::icons::button(ui, icon, 28.0, on, tip).clicked() {
+            app.ui.selection_mode = mode;
+        }
+    }
+    ui.spacing_mut().item_spacing.x = 8.0;
+}
+
+"""
+
+fix_source("crates/ui-egui/src/retouch_ui.rs", HELPER_ANCHOR, HELPER + HELPER_ANCHOR, "the New/Add/Subtract buttons")
+
+# ---- They go first on the bar, where Photoshop puts them, and replace the "Alt to subtract"
+# hint that asked for a key the tablet does not have. `o` is re-borrowed after the call: the
+# outer borrow is dead on this arm once nothing below uses it.
+
+BAR_ANCHOR = """        Tool::QuickSelection => {
+            crate::widgets::checkbox(ui, &mut o.sample_all.quick_selection, tl!("Sample All Layers"));
+            crate::widgets::checkbox(ui, &mut o.enhance_edge, tl!("Enhance Edge"));
+            opt(ui, &crate::i18n::fmt(tl!("{key} to subtract"), &[("key", &crate::shortcuts::pretty("Alt"))]));
+            crate::widgets::vline(ui, 22.0);"""
+
+BAR = """        Tool::QuickSelection => {
+            quick_selection_mode_buttons(app, ui);
+            crate::widgets::vline(ui, 22.0);
+            let o = &mut app.ui.tool_options;
+            crate::widgets::checkbox(ui, &mut o.sample_all.quick_selection, tl!("Sample All Layers"));
+            crate::widgets::checkbox(ui, &mut o.enhance_edge, tl!("Enhance Edge"));
+            crate::widgets::vline(ui, 22.0);"""
+
+fix_source("crates/ui-egui/src/retouch_ui.rs", BAR_ANCHOR, BAR, "the buttons on the options bar")
+
+# ---- And the stroke honours them. Alt still wins, so the desktop gesture is unchanged.
+
+MODE_ANCHOR = """            let mode = if mods.alt { "subtract" } else { "add" };"""
+
+MODE = """            let mode = if mods.alt {
+                "subtract"
+            } else {
+                match app.ui.selection_mode {
+                    0 => "new",
+                    2 => "subtract",
+                    // Intersect has no mode in `select.quick`; it behaves as Add.
+                    _ => "add",
+                }
+            };"""
+
+fix_source("crates/ui-egui/src/retouch_ui.rs", MODE_ANCHOR, MODE, "the stroke reading the mode")
+
+if missing:
+    print(f"  Could not patch the Quick Selection mode for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the Quick Selection mode for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 11. choose the save format inside the app (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+# ---- The parked save and the chooser, beside the dialog machinery they belong to.
+
+ASK_ANCHOR = """use crate::PhotocraftApp;
+use crate::file_open::display_name;
+"""
+
+ASK = r"""
+/// A Save As waiting for its format, because the platform save dialog has no file type list.
+///
+/// On a desktop the format comes from the save dialog's list of file types, which PhotoCraft
+/// fills (`SAVE_FILTERS` in the shell) and the system draws. Android's picker has no such list:
+/// it gives a folder and a name and nothing else. So every save took whichever extension was
+/// suggested, and PSD, PDF, JPEG and the rest could not be chosen at all. The format is picked
+/// in the app instead (`save_format_window`), and the folder picker opens after, with the
+/// extension already on the name.
+pub struct SaveFormatAsk {
+    pub suggested: String,
+    pub doc: DocId,
+    pub plain_save: bool,
+    pub choices: crate::FormatChoices,
+}
+
+/// The formats offered, in the order they are listed. PSD first: it is PhotoCraft's own default
+/// save format, and of these it is what Photoshop reopens with the layers intact.
+const SAVE_FORMATS: [(&str, &str, &str); 7] = [
+    ("psd", "PSD", "Photoshop: layers, masks, text and smart objects kept"),
+    ("pcraft", "PhotoCraft", "Everything PSD keeps, and what PSD has no room for"),
+    ("pdf", "PDF", "A document to send or to print"),
+    ("png", "PNG", "Flat, lossless, transparency kept"),
+    ("jpg", "JPEG", "Flat, small, no transparency"),
+    ("tif", "TIFF", "For print; keeps layers when asked"),
+    ("webp", "WebP", "Flat and small, for the web"),
+];
+
+/// The format chooser for a parked Save As: one finger-sized button per format. Picking one puts
+/// its extension on the suggested name and goes on to the folder picker.
+pub(crate) fn save_format_window(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    if app.save_format.is_none() {
+        return;
+    }
+    let mut picked: Option<&'static str> = None;
+    let mut cancel = false;
+    let modal = egui::Modal::new(egui::Id::new("save-format")).show(ctx, |ui| {
+        ui.set_max_width(420.0);
+        ui.label(egui::RichText::new(tl!("Save As")).font(crate::theme::semibold(15.0)));
+        ui.add_space(4.0);
+        crate::widgets::hairline(ui);
+        ui.add_space(8.0);
+        ui.label(tl!("Choose a format. The next screen asks where to put the file."));
+        ui.add_space(10.0);
+        let width = ui.available_width();
+        for (ext, name, about) in SAVE_FORMATS {
+            let hit = if ext == "psd" { crate::widgets::primary_button(ui, name, width) } else { crate::widgets::secondary_button(ui, name, width) };
+            if hit.on_hover_text(tl!(about)).clicked() {
+                picked = Some(ext);
+            }
+            ui.add_space(5.0);
+        }
+        ui.add_space(6.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            cancel = crate::widgets::secondary_button(ui, tl!("Cancel"), 84.0).clicked();
+        });
+    });
+    cancel |= modal.should_close();
+    if let Some(ext) = picked {
+        let Some(ask) = app.save_format.take() else { return };
+        let suggested = Path::new(&ask.suggested).with_extension(ext).to_string_lossy().into_owned();
+        if let Err(e) = app.save_pick(suggested, ask.doc, ask.plain_save, ask.choices) {
+            app.ui.status = crate::i18n::fmt(tl!("Save failed: {error}"), &[("error", &e)]);
+            app.ui.status_error = true;
+        }
+    } else if cancel {
+        app.save_format = None;
+    }
+}
+"""
+
+fix_source("crates/ui-egui/src/file_dialog.rs", ASK_ANCHOR, ASK_ANCHOR + ASK, "the format chooser")
+
+# ---- Where the parked save is held.
+
+FIELD_ANCHOR = """    /// A Save As to a layered TIFF parked behind the TIFF Options prompt (see `tiff_options_ui`).
+    pub(crate) tiff_options: Option<tiff_options_ui::Prompt>,"""
+
+FIELD = """
+    /// A Save As waiting for its format to be chosen in the app, because the platform save
+    /// dialog has no file type list (see `file_dialog::SaveFormatAsk`).
+    pub(crate) save_format: Option<file_dialog::SaveFormatAsk>,"""
+
+fix_source("crates/ui-egui/src/lib.rs", FIELD_ANCHOR, FIELD_ANCHOR + FIELD, "the field holding it")
+
+INIT_ANCHOR = """            tiff_options: None,
+            save_dirs: HashMap::new(),"""
+
+INIT = """            tiff_options: None,
+            save_format: None,
+            save_dirs: HashMap::new(),"""
+
+fix_source("crates/ui-egui/src/lib.rs", INIT_ANCHOR, INIT, "its initial value")
+
+# ---- Save As parks on a touch screen instead of going straight to the picker. The tail that
+# asks where to put the file becomes `save_pick`, so the chooser reuses it unchanged.
+
+FLOW_ANCHOR = """        let doc = st.doc.id;
+        self.pick_save(&suggested, move |app, path| {
+            app.with_document(doc, |app| {"""
+
+FLOW = """        let doc = st.doc.id;
+        // The save dialog's file type list is what chooses the format, and Android's picker has
+        // none: it gives a folder and a name. So on a touch screen the format is chosen in the
+        // app first (`file_dialog::save_format_window`), which then calls `save_pick` below.
+        if cfg!(target_os = "android") {
+            if self.save_format.is_none() {
+                self.save_format = Some(file_dialog::SaveFormatAsk { suggested, doc, plain_save, choices });
+            }
+            return Ok(serde_json::json!({"saveFormat": "asking"}));
+        }
+        self.save_pick(suggested, doc, plain_save, choices)
+    }
+
+    /// [`Self::save_dialog_flow`] once the format is settled: ask where to put the file, then
+    /// write it there.
+    pub(crate) fn save_pick(&mut self, suggested: String, doc: DocId, plain_save: bool, choices: FormatChoices) -> Result<Value, String> {
+        self.pick_save(&suggested, move |app, path| {
+            app.with_document(doc, |app| {"""
+
+fix_source("crates/ui-egui/src/lib.rs", FLOW_ANCHOR, FLOW, "Save As parked for the format")
+
+# ---- Drawn with the other parked save prompts.
+
+CALL_ANCHOR = """        tiff_options_ui::show(self, &ctx);"""
+
+CALL = """        file_dialog::save_format_window(self, &ctx);
+        tiff_options_ui::show(self, &ctx);"""
+
+fix_source("crates/ui-egui/src/lib.rs", CALL_ANCHOR, CALL, "the chooser drawn each frame")
+
+if missing:
+    print(f"  Could not patch the save format chooser for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the save format chooser for {app}: {', '.join(fixed)}")
+PY
+fi
+
