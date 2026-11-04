@@ -215,6 +215,65 @@
 #    Targa and DDS option prompts, the disk-change check and the action journal are all unchanged.
 #
 #
+# 12. SHIFT, ALT AND CTRL AS BUTTONS (PhotoCraft).
+#
+#    339 behaviours in PhotoCraft are reached only by holding a modifier key: 124 behind Alt,
+#    114 behind Shift, 101 behind Ctrl. Subtracting from a selection, constraining proportions,
+#    scaling from the centre, duplicating by dragging, stepping a caret word by word. A tablet
+#    has none of those keys, so half of nearly every tool was out of reach -- and a clean cut-out,
+#    which needs both adding and taking away, could not be finished at all.
+#
+#    Affinity answers this by putting a tool's modes in its context bar. Adobe, on iPad, adds a
+#    floating button tied to the active tool. This takes Adobe's shape, because it is the one
+#    that covers everything at once instead of one tool at a time: three buttons floating over
+#    the canvas, dragged by a grip to wherever they are not in the way.
+#
+#    One tap arms a modifier for the next gesture and it releases itself when that gesture ends;
+#    a second tap locks it until it is tapped off; a third clears it. So one finger can subtract
+#    from a selection, and a long piece of work needing the same modifier throughout locks it once.
+#
+#    What makes it general is where it is applied: the block's state is folded into the frame's
+#    input in raw_input_hook, before any widget reads it -- into the frame's modifier state and
+#    into every event that carries modifiers. So all 339 work unchanged, and so do the keyboard
+#    shortcuts; not one of those 339 places had to learn that buttons exist. A release that ends
+#    a gesture on the canvas is what disarms an armed modifier; a release on the block itself is
+#    ignored, or tapping a button would disarm what the tap had just armed.
+#
+#
+# 13. A MEMORY BUDGET A TABLET ACTUALLY HAS (PhotoCraft).
+#
+#    PhotoCraft ships believing it may use 8 GB of memory, and keeps fifty undo steps inside that
+#    budget. Those are a workstation's numbers, and they are not a cap the app approaches
+#    carefully: the budget is what decides when the oldest history states are dropped, so at 8 GB
+#    on a tablet they are never dropped at all.
+#
+#    Android shares one pool of memory between the system, the screen and every running app, and
+#    kills whichever one grows too far. The app was not crashing; it was being killed -- and it
+#    was being killed during a save, which is where the most memory is wanted at once, because a
+#    layer's interleaved samples and the channel planes made from them are alive together.
+#
+#    1 GB and twenty steps. The document's pixels are untouched, at full resolution, on screen and
+#    on export: the budget drops old history states and nothing else. Both remain on Preferences >
+#    Performance for a tablet with room to spare.
+#
+#
+# 14. DIALOGS THAT FIT THE SCREEN THEY OPEN ON (PhotoCraft).
+#
+#    Two faults, both of them the same mistake: a window's size written for a monitor.
+#
+#    A resizable dialog opens at 620 x 480 points. A tablet held upright gives the app about 533
+#    points across, so New Document opened wider than the screen, and its right-hand column -- the
+#    one holding Width, Height and the Create button -- was not on the screen at all, with nothing
+#    to show there was more. Held flat there are 853 points and it fits, which is why this looked
+#    like a portrait-only fault. Section 5 bounded the dialog's height and section 7 lowered the
+#    size it can be dragged down to; neither touched the size it OPENS at, which is the one that
+#    mattered. It is now clamped to what the window can hold.
+#
+#    And on Android the window runs under the system navigation bar. A centred dialog as tall as
+#    the screen allowed put its bottom row -- Create again -- on top of the back and home buttons.
+#    Dialogs now leave room for those.
+#
+#
 # To build WITHOUT all of this, comment out the call to this script in lib/build-common.sh.
 #
 # Usage: ime.sh <source-dir> <app> <title>
@@ -1849,6 +1908,392 @@ if missing:
     sys.exit(1)
 if fixed:
     print(f"  Patched the save format chooser for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 12. Shift, Alt and Ctrl as buttons (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+# ---- The block, and the function that folds its state into the frame's input.
+
+BLOCK_ANCHOR = """// ----------------------------------------------------------------------------- properties"""
+
+BLOCK = r"""// ------------------------------------------------------------------ touch modifiers
+
+/// What one of the touch modifier buttons is doing.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum Sticky {
+    /// Not held.
+    #[default]
+    Off,
+    /// Held for the next gesture, then released by itself.
+    Armed,
+    /// Held until it is tapped off.
+    Locked,
+}
+
+/// Height of the block, the side of one of its buttons, and the width of a button and the grip.
+const TOUCH_MOD_H: f32 = 56.0;
+const TOUCH_MOD_BTN: f32 = 44.0;
+const TOUCH_MOD_W: f32 = 54.0;
+const TOUCH_MOD_GRIP: f32 = 18.0;
+
+fn touch_mods_id() -> egui::Id {
+    egui::Id::new("touch-modifiers")
+}
+
+fn touch_mods_rect_id() -> egui::Id {
+    egui::Id::new("touch-modifiers-rect")
+}
+
+fn touch_mods_offset_id() -> egui::Id {
+    egui::Id::new("touch-modifiers-offset")
+}
+
+/// Shift, Alt and Ctrl as the block has them: `[shift, alt, ctrl]`.
+pub(crate) fn touch_mods(ctx: &egui::Context) -> [Sticky; 3] {
+    ctx.data(|d| d.get_temp::<[Sticky; 3]>(touch_mods_id())).unwrap_or_default()
+}
+
+fn set_touch_mods(ctx: &egui::Context, state: [Sticky; 3]) {
+    ctx.data_mut(|d| d.insert_temp(touch_mods_id(), state));
+}
+
+/// The modifiers `state` stands for. Ctrl is also the command modifier: the platform that tells
+/// them apart is macOS, which is not where a touch screen runs this.
+fn touch_modifiers_of(state: [Sticky; 3]) -> egui::Modifiers {
+    let mut m = egui::Modifiers::default();
+    m.shift = state[0] != Sticky::Off;
+    m.alt = state[1] != Sticky::Off;
+    m.ctrl = state[2] != Sticky::Off;
+    m.command = state[2] != Sticky::Off;
+    m
+}
+
+/// `base` with everything `extra` holds added. Only the four fields the block drives are touched,
+/// so a modifier the window reported stays as it was.
+fn with_modifiers(base: egui::Modifiers, extra: egui::Modifiers) -> egui::Modifiers {
+    let mut out = base;
+    out.shift |= extra.shift;
+    out.alt |= extra.alt;
+    out.ctrl |= extra.ctrl;
+    out.command |= extra.command;
+    out
+}
+
+/// Fold the touch modifier block into this frame's input, before any widget reads it.
+///
+/// A tablet has no Shift, Alt or Ctrl, and 339 behaviours in PhotoCraft are reached only by
+/// holding one: subtracting from a selection, constraining proportions, scaling from the centre,
+/// duplicating by dragging, stepping a caret word by word. Rather than teach each of those about
+/// buttons, the block's state is written into the frame's modifier state and into every event
+/// that carries modifiers, so all 339 work unchanged -- and so do the keyboard shortcuts.
+///
+/// An armed modifier lasts one gesture: the pointer release that ends a gesture on the canvas
+/// clears it. A release on the block itself is ignored, or tapping a button would disarm what
+/// the tap just armed. A locked modifier stays until it is tapped off.
+pub fn apply_touch_modifiers(app: &mut PhotocraftApp, ctx: &egui::Context, raw: &mut egui::RawInput) {
+    let state = touch_mods(ctx);
+    if state == [Sticky::Off; 3] {
+        return;
+    }
+    let m = touch_modifiers_of(state);
+    for e in raw.events.iter_mut() {
+        match e {
+            egui::Event::PointerButton { modifiers, .. } | egui::Event::Key { modifiers, .. } | egui::Event::MouseWheel { modifiers, .. } => {
+                *modifiers = with_modifiers(*modifiers, m);
+            }
+            egui::Event::ModifiersChanged(k) => *k = with_modifiers(*k, m),
+            _ => {}
+        }
+    }
+    raw.events.insert(0, egui::Event::ModifiersChanged(m));
+    let canvas = app.last_canvas_rect;
+    let block = ctx.data(|d| d.get_temp::<Rect>(touch_mods_rect_id()));
+    let ended = raw.events.iter().any(|e| match e {
+        egui::Event::PointerButton { pos, pressed: false, .. } => canvas.contains(*pos) && !block.is_some_and(|b| b.contains(*pos)),
+        _ => false,
+    });
+    if ended {
+        let mut next = state;
+        for s in next.iter_mut() {
+            if *s == Sticky::Armed {
+                *s = Sticky::Off;
+            }
+        }
+        if next != state {
+            set_touch_mods(ctx, next);
+        }
+    }
+}
+
+/// One of the block's buttons: plain when off, outlined in the accent when armed for the next
+/// gesture, filled when locked.
+fn touch_mod_button(ui: &mut egui::Ui, label: &str, state: Sticky) -> egui::Response {
+    let t = Tokens::get(ui.ctx());
+    let (rect, resp) = ui.allocate_exact_size(vec2(TOUCH_MOD_W, TOUCH_MOD_BTN), Sense::click());
+    let (fill, fg) = match state {
+        Sticky::Off => (t.field, t.text),
+        Sticky::Armed => (t.card, t.accent),
+        Sticky::Locked => (t.accent, t.primary_text),
+    };
+    ui.painter().rect_filled(rect, t.radius_sm, fill);
+    if state == Sticky::Armed {
+        ui.painter().rect_stroke(rect, t.radius_sm, Stroke::new(1.5, t.accent), StrokeKind::Inside);
+    }
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, theme::medium(13.0), fg);
+    resp
+}
+
+/// Shift, Alt and Ctrl floating over the canvas, for a screen with no keyboard (Android).
+///
+/// One tap arms a modifier for the next gesture, a second locks it, a third clears it -- so a
+/// single finger can subtract from a selection, and a long piece of work that needs the same
+/// modifier throughout can lock it once. Drag the grip to move the block off what is being
+/// worked on. `apply_touch_modifiers` is what makes the state real.
+pub fn touch_modifiers(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    if !cfg!(target_os = "android") || app.ui.docking.is_some() {
+        return;
+    }
+    let canvas = if app.last_canvas_rect.is_positive() { app.last_canvas_rect } else { ctx.content_rect() };
+    if !canvas.is_positive() {
+        return;
+    }
+    let t = Tokens::get(ctx);
+    let state = touch_mods(ctx);
+    let offset: egui::Vec2 = ctx.data(|d| d.get_temp(touch_mods_offset_id())).unwrap_or_default();
+    let pos = pos2(canvas.left() + 12.0, canvas.bottom() - TOUCH_MOD_H - 12.0) + offset;
+    let frame = egui::Frame::NONE
+        .fill(t.dock)
+        .stroke(Stroke::new(1.0, t.card_border))
+        .corner_radius(CornerRadius::same(t.radius_lg as u8))
+        .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: t.shadow })
+        .inner_margin(egui::Margin::same(6));
+    let labels = [crate::shortcuts::pretty("Shift"), crate::shortcuts::pretty("Alt"), crate::shortcuts::pretty("Ctrl")];
+    let mut next = state;
+    let mut drag = egui::Vec2::ZERO;
+    // Order::Middle, like the other floating panels, so menus and dialogs stay above it.
+    let shown = egui::Area::new(egui::Id::new("touch-mods-area")).order(egui::Order::Middle).fixed_pos(pos).show(ctx, |ui| {
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let (grip, _) = ui.allocate_exact_size(vec2(TOUCH_MOD_GRIP, TOUCH_MOD_BTN), Sense::hover());
+                let hold = ui.interact(grip, egui::Id::new("touch-mods-grip"), Sense::drag());
+                if hold.hovered() || hold.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+                drag = hold.drag_delta();
+                let c = grip.center();
+                for x in [c.x - 3.0, c.x + 3.0] {
+                    for y in [c.y - 6.0, c.y, c.y + 6.0] {
+                        ui.painter().circle_filled(pos2(x, y), 1.4, t.text_faint);
+                    }
+                }
+                for (i, label) in labels.iter().enumerate() {
+                    if touch_mod_button(ui, label, state[i]).clicked() {
+                        next[i] = match state[i] {
+                            Sticky::Off => Sticky::Armed,
+                            Sticky::Armed => Sticky::Locked,
+                            Sticky::Locked => Sticky::Off,
+                        };
+                    }
+                }
+            });
+        });
+    });
+    let rect = shown.response.rect;
+    ctx.data_mut(|d| d.insert_temp(touch_mods_rect_id(), rect));
+    if drag != egui::Vec2::ZERO {
+        // Keep the block inside the canvas, as the Properties card keeps its title bar inside it.
+        let r = rect.translate(drag);
+        let dx = (canvas.left() - r.left()).max(0.0) - (r.right() - canvas.right()).max(0.0);
+        let dy = (canvas.top() - r.top()).max(0.0) - (r.bottom() - canvas.bottom()).max(0.0);
+        ctx.data_mut(|d| d.insert_temp(touch_mods_offset_id(), offset + drag + vec2(dx, dy)));
+    }
+    if next != state {
+        set_touch_mods(ctx, next);
+    }
+}
+
+"""
+
+fix_source("crates/ui-egui/src/panels.rs", BLOCK_ANCHOR, BLOCK + BLOCK_ANCHOR, "the modifier block")
+
+# ---- Folded into the input before any widget reads it, beside the other input fix-ups.
+
+HOOK_ANCHOR = """        // A pen held still is no touch screen's press-and-hold right click (stylus.rs).
+        let pen_down = self.stylus.pen_contacts.observe(&raw_input.events);"""
+
+HOOK = """        // Shift, Alt and Ctrl tapped on the touch modifier block stand in for the keys a tablet
+        // has not got: they join this frame's modifiers and every event that carries them.
+        panels::apply_touch_modifiers(self, ctx, raw_input);
+"""
+
+fix_source("crates/ui-egui/src/lib.rs", HOOK_ANCHOR, HOOK + HOOK_ANCHOR, "the modifiers folded into the input")
+
+# ---- Drawn over the canvas, with the other floating panels.
+
+CALL_ANCHOR = """        brush_panel::window(self, &ctx);"""
+
+CALL = """        panels::touch_modifiers(self, &ctx);
+        brush_panel::window(self, &ctx);"""
+
+fix_source("crates/ui-egui/src/lib.rs", CALL_ANCHOR, CALL, "the block drawn over the canvas")
+
+if missing:
+    print(f"  Could not patch the touch modifiers for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the touch modifiers for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 13. a memory budget a tablet actually has (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+OLD = """            memory_usage_mb: DEFAULT_MEMORY_USAGE_MB,
+            history_states: 50,"""
+
+NEW = """            // 8 GB and fifty undo steps are a workstation's numbers. Android shares one pool of
+            // memory between the system, the screen and every app, and kills the one that grows:
+            // a save, which gathers a layer's pixels and the channel planes made from them at the
+            // same time, is where it was being killed. 1 GB and twenty steps leave the document's
+            // pixels untouched -- the budget drops the oldest history states, nothing else -- and
+            // both stay on Preferences > Performance for a tablet that can afford more.
+            memory_usage_mb: if cfg!(target_os = "android") { 1024 } else { DEFAULT_MEMORY_USAGE_MB },
+            history_states: if cfg!(target_os = "android") { 20 } else { 50 },"""
+
+fix_source("crates/engine/src/prefs.rs", OLD, NEW, "the memory budget and the history depth")
+
+if missing:
+    print(f"  Could not patch the memory budget for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the memory budget for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 14. dialogs that fit the screen they open on (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+D = "crates/ui-egui/src/dialogs.rs"
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+# ---- The size a dialog opens at has to fit the window it opens in.
+
+OPEN_OLD = """        let resize = resizable.map(|size| {
+            let min = resizable_min(&fields);
+            (remembered.unwrap_or(size), min, resizable_max(ctx, &fields, min))
+        });"""
+
+OPEN_NEW = """        let resize = resizable.map(|size| {
+            let min = resizable_min(&fields);
+            let max = resizable_max(ctx, &fields, min);
+            // The size a dialog OPENS at has to fit the window it opens in, not only the size it
+            // can be dragged to. 620 x 480 is written for a monitor. A tablet held upright gives
+            // about 533 points across, so New Document opened wider than the screen and its
+            // right-hand column -- the one holding Create -- was not on the screen at all, with
+            // nothing to show there was more. Clamping here keeps the roomy layout everywhere it
+            // fits and trims it only where it does not.
+            let fit = |v: egui::Vec2| egui::vec2(v.x.clamp(min.x, max.x), v.y.clamp(min.y, max.y));
+            (fit(remembered.unwrap_or(size)), min, max)
+        });"""
+
+fix_source(D, OPEN_OLD, OPEN_NEW, "dialogs opening no wider than the screen")
+
+# ---- And room for the system bars underneath.
+
+ROOM_OLD = """    let mut max = (ctx.content_rect().size() - egui::vec2(40.0, 40.0)).max(min);"""
+
+ROOM_NEW = """    // 40 points of breathing room on a desktop. On Android the window runs under the system
+    // navigation bar, so a centred dialog as tall as the screen allows had its bottom row -- the
+    // one with Create -- sitting on top of the back and home buttons. Leaving more pulls it clear.
+    let room = if cfg!(target_os = "android") { egui::vec2(40.0, 112.0) } else { egui::vec2(40.0, 40.0) };
+    let mut max = (ctx.content_rect().size() - room).max(min);"""
+
+fix_source(D, ROOM_OLD, ROOM_NEW, "room for the system bars")
+
+if missing:
+    print(f"  Could not patch the dialog sizes for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the dialog sizes for {app}: {', '.join(fixed)}")
 PY
 fi
 
