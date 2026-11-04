@@ -274,6 +274,50 @@
 #    Dialogs now leave room for those.
 #
 #
+# 15. MENUS THAT OPEN ON A TAP, NOT ON A HELD FINGER (PhotoCraft).
+#
+#    The Layers panel's footer menus -- fx (layer styles) and the adjustment-layer list -- and
+#    every drop-down list open on the PRESS, so that one gesture can press the button, slide onto
+#    an item and release on it. That is Photoshop's own behaviour, and with a mouse it is right.
+#
+#    With a finger it falls apart. A finger that moves three points between the press and the
+#    release is a drag, not a click, so the release that ended the opening press counted as a
+#    click OUTSIDE the menu and closed it again. The menu stayed up only while the finger stayed
+#    down, and choosing an entry meant pressing, sliding onto it and letting go without a wobble.
+#
+#    On Android they now open on the release and wait: tap to open, tap an entry to choose it,
+#    tap outside to close. The drop-down lists keep egui's own behaviour, which is already that.
+#
+#
+# 16. QUICK SELECTION GROWS AGAIN AFTER ITS FIRST STROKE (PhotoCraft).
+#
+#    A regression this script introduced, and the reason the tool felt worse than before.
+#
+#    Section 10 gave Quick Selection the options bar's New / Add / Subtract buttons and made the
+#    stroke read the mode. But the shared selection mode starts at New -- and before section 10
+#    the stroke was hardcoded to add. So every stroke began wiping the one before it, and a
+#    cut-out, which is built stroke by stroke, could not be built at all.
+#
+#    New now applies to the first stroke only; the tool switches to Add after it, which is what
+#    Photoshop's Quick Selection does. The buttons keep their three meanings.
+#
+#
+# 17. A SHORT TOOL COLUMN, AND EVERY TOOL ONE TAP AWAY (PhotoCraft).
+#
+#    The tool column carries twenty-one slots. On a 10-inch screen that is the whole height of the
+#    window spent on tools, with the image squeezed into what is left -- and it still scrolls.
+#
+#    On Android the column now keeps eight: Move, the lasso, the selection family, Crop, Brush,
+#    Eraser, Type and Zoom. Each keeps its flyout, so the variants are still a long press away.
+#
+#    The rest live behind the "..." button that was already at the foot of the column. On a
+#    desktop it opens Edit > Toolbar, a dialog written for a mouse; on Android it now opens every
+#    tool at once, over the canvas, four to a row with its name under each icon -- because a column
+#    has no room for names and an icon you cannot read is not a tool you can find. Tapping one
+#    selects it and closes the grid; tapping "..." again closes it too. Tools hidden in
+#    Edit > Toolbar stay hidden there as well.
+#
+#
 # To build WITHOUT all of this, comment out the call to this script in lib/build-common.sh.
 #
 # Usage: ime.sh <source-dir> <app> <title>
@@ -2294,6 +2338,347 @@ if missing:
     sys.exit(1)
 if fixed:
     print(f"  Patched the dialog sizes for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 15. menus that open on a tap, not on a held finger (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+P = "crates/ui-egui/src/press_menu.rs"
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+# ---- The menu opens on the release, not the press.
+
+OPEN_OLD = """    // A press this frame on the button (still down, or a whole click within one frame).
+    let pressed = ctx.input(|i| i.pointer.primary_pressed()) && (button.is_pointer_button_down_on() || button.clicked());"""
+
+OPEN_NEW = """    // A touch screen has no press-drag-release. A finger that moves three points between the
+    // press and the release is a drag, not a click, so the release that ended the opening press
+    // counted as a click outside the menu and shut it again: the menu stayed up only while the
+    // finger stayed down, and choosing an item meant pressing, sliding onto it and letting go.
+    // So on Android the menu opens on the release and waits there: tap to open, tap to choose.
+    if cfg!(target_os = "android") {
+        if !button.clicked() {
+            return None;
+        }
+        return Some(SetOpenCommand::Bool(!Popup::is_id_open(ctx, popup)));
+    }
+    // A press this frame on the button (still down, or a whole click within one frame).
+    let pressed = ctx.input(|i| i.pointer.primary_pressed()) && (button.is_pointer_button_down_on() || button.clicked());"""
+
+fix_source(P, OPEN_OLD, OPEN_NEW, "menus opening on the tap")
+
+# ---- And nothing but a tap outside closes it. An item still closes it itself (`item_response`).
+
+CLOSE_OLD = """    let close = if button.clicked() && menu.owns_gesture(&ctx) { PopupCloseBehavior::IgnoreClicks } else { PopupCloseBehavior::CloseOnClick };"""
+
+CLOSE_NEW = """    let close = if cfg!(target_os = "android") {
+        // The tap that opened it must not shut it, and a tap inside is the item's own business.
+        PopupCloseBehavior::CloseOnClickOutside
+    } else if button.clicked() && menu.owns_gesture(&ctx) {
+        PopupCloseBehavior::IgnoreClicks
+    } else {
+        PopupCloseBehavior::CloseOnClick
+    };"""
+
+fix_source(P, CLOSE_OLD, CLOSE_NEW, "menus staying open until a tap outside")
+
+# ---- The same for the drop-down lists (blend mode, and every other combo box).
+
+COMBO_OLD = """        if combo.owns_gesture(ctx) && ctx.input(|i| i.pointer.primary_clicked()) {
+            Popup::close_id(ctx, combo.popup);
+            return (combo, PopupCloseBehavior::IgnoreClicks);
+        }
+        (combo, PopupCloseBehavior::CloseOnClick)"""
+
+COMBO_NEW = """        // On a touch screen the box keeps egui's own behaviour: a tap opens the list, a tap on
+        // an option chooses it, a tap outside closes it. Nothing is opened on the press.
+        if cfg!(target_os = "android") {
+            return (combo, PopupCloseBehavior::CloseOnClickOutside);
+        }
+        if combo.owns_gesture(ctx) && ctx.input(|i| i.pointer.primary_clicked()) {
+            Popup::close_id(ctx, combo.popup);
+            return (combo, PopupCloseBehavior::IgnoreClicks);
+        }
+        (combo, PopupCloseBehavior::CloseOnClick)"""
+
+fix_source(P, COMBO_OLD, COMBO_NEW, "drop-down lists opening on the tap")
+
+AFTER_OLD = """        let pressed = ctx.input(|i| i.pointer.primary_pressed()) && button.is_pointer_button_down_on();
+        if pressed && !Popup::is_id_open(ctx, self.popup) {"""
+
+AFTER_NEW = """        let pressed = !cfg!(target_os = "android") && ctx.input(|i| i.pointer.primary_pressed()) && button.is_pointer_button_down_on();
+        if pressed && !Popup::is_id_open(ctx, self.popup) {"""
+
+fix_source(P, AFTER_OLD, AFTER_NEW, "no press-open on the lists")
+
+if missing:
+    print(f"  Could not patch the tap menus for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the tap menus for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 16. Quick Selection grows again after its first stroke (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+OLD = """            let r = app.run("select.quick", json!({"points": xy, "size": size, "mode": mode, "enhanceEdge": enhance, "sampleAllLayers": sample_all}));
+            report_smart_result(app, r, tl!("Quick Selection found nothing there"));"""
+
+NEW = """            let r = app.run("select.quick", json!({"points": xy, "size": size, "mode": mode, "enhanceEdge": enhance, "sampleAllLayers": sample_all}));
+            // Quick Selection is built stroke by stroke, so New applies to the first stroke only
+            // and the tool then switches to Add, as Photoshop's does. Before section 10 the stroke
+            // was always an add; reading the options bar's mode made New the default and every
+            // stroke wiped the one before it, which is no way to cut anything out.
+            if mode == "new" {
+                app.ui.selection_mode = 1;
+            }
+            report_smart_result(app, r, tl!("Quick Selection found nothing there"));"""
+
+fix_source("crates/ui-egui/src/retouch_ui.rs", OLD, NEW, "New applying to the first stroke only")
+
+if missing:
+    print(f"  Could not patch the Quick Selection mode switch for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the Quick Selection mode switch for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 17. a short tool column, and every tool one tap away (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+
+# ---- The slots the column keeps, and the grid that holds the rest.
+
+GRID_ANCHOR = """/// A primary-button gesture started on this tool; open only after it leaves its hit area."""
+
+GRID = r"""/// The slots the tool column keeps on a touch screen, by their index in [`TOOL_SECTIONS`]: Move,
+/// the lasso, the selection family, Crop, Brush, Eraser, Type and Zoom. Twenty-one slots of
+/// 40-point buttons do not fit a 10-inch screen and leave nothing for the image; the rest are one
+/// tap away under the column's own "..." button (`tool_grid`), as Photoshop is on a tablet.
+const TOUCH_SLOTS: [usize; 8] = [0, 2, 3, 4, 8, 11, 16, 20];
+
+fn tool_grid_id() -> egui::Id {
+    egui::Id::new("tool-grid-open")
+}
+
+pub(crate) fn tool_grid_open(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(tool_grid_id())).unwrap_or(false)
+}
+
+pub(crate) fn set_tool_grid_open(ctx: &egui::Context, open: bool) {
+    ctx.data_mut(|d| d.insert_temp(tool_grid_id(), open));
+}
+
+/// Every tool at once, over the canvas: what the column's "..." button opens on a touch screen.
+///
+/// Four to a row, each with its name under its icon -- a tool is no use if you cannot tell which
+/// it is, and the column has no room for names. Tapping one selects it and closes the grid. The
+/// tools hidden in Edit > Toolbar stay hidden here too.
+pub fn tool_grid(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    if !tool_grid_open(ctx) {
+        return;
+    }
+    let t = Tokens::get(ctx);
+    let canvas = if app.last_canvas_rect.is_positive() { app.last_canvas_rect } else { ctx.content_rect() };
+    if !canvas.is_positive() {
+        set_tool_grid_open(ctx, false);
+        return;
+    }
+    let cell = vec2(74.0, 62.0);
+    let width = cell.x * 4.0 + 6.0 * 3.0 + 24.0;
+    let height = (canvas.height() - 24.0).min(430.0).max(180.0);
+    let x = if crate::direction::is_rtl() { canvas.right() - width - 12.0 } else { canvas.left() + 12.0 };
+    let frame = egui::Frame::NONE
+        .fill(t.card)
+        .stroke(Stroke::new(1.0, t.card_border))
+        .corner_radius(CornerRadius::same(t.radius_lg as u8))
+        .shadow(egui::Shadow { offset: [0, 12], blur: 36, spread: 0, color: t.shadow })
+        .inner_margin(egui::Margin::same(12));
+    let shown = visible_sections(&app.session.prefs().toolbar.hidden);
+    let tools: Vec<Tool> = shown.into_iter().flatten().flat_map(|(_, slot)| slot).collect();
+    let mut chosen = None;
+    let mut shut = false;
+    egui::Area::new(egui::Id::new("tool-grid-area")).order(egui::Order::Middle).fixed_pos(pos2(x, canvas.top() + 12.0)).show(ctx, |ui| {
+        frame.show(ui, |ui| {
+            ui.set_width(width - 24.0);
+            ui.set_height(height - 24.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(tl!("Tools")).font(theme::semibold(14.0)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icons::button(ui, "x", 30.0, false, tl!("Close")).clicked() {
+                        shut = true;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            widgets::hairline(ui);
+            ui.add_space(8.0);
+            let room = ui.available_height().max(0.0);
+            egui::ScrollArea::vertical().id_salt("tool-grid-scroll").max_height(room).auto_shrink([false, false]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                for row in tools.chunks(4) {
+                    ui.horizontal(|ui| {
+                        for &tool in row {
+                            let (r, resp) = ui.allocate_exact_size(cell, Sense::click());
+                            let on = app.ui.tool == tool;
+                            if on || resp.hovered() {
+                                ui.painter().rect_filled(r, t.radius_sm, if on { t.accent } else { t.hover });
+                            }
+                            let fg = if on { t.primary_text } else { t.text };
+                            icons::paint(ui, Rect::from_center_size(pos2(r.center().x, r.top() + 22.0), vec2(22.0, 22.0)), icons::tool_icon(tool), 22.0, fg);
+                            let galley = ui.painter().layout(tl!(tool.label()).to_string(), theme::medium(9.5), fg, cell.x - 6.0);
+                            ui.painter().galley(pos2(r.center().x - galley.size().x / 2.0, r.top() + 38.0), galley, fg);
+                            if resp.clicked() {
+                                chosen = Some(tool);
+                            }
+                        }
+                    });
+                }
+            });
+        });
+    });
+    if let Some(tool) = chosen {
+        crate::tool_memory::select(app, tool);
+        set_tool_grid_open(ctx, false);
+    } else if shut {
+        set_tool_grid_open(ctx, false);
+    }
+}
+
+/// A primary-button gesture started on this tool; open only after it leaves its hit area."""
+
+fix_source("crates/ui-egui/src/panels.rs", GRID_ANCHOR, GRID, "the full tool grid")
+
+# ---- The column keeps the basics.
+
+COL_ANCHOR = """    let sections = visible_sections(&app.session.prefs().toolbar.hidden);"""
+
+COL = """    let sections = visible_sections(&app.session.prefs().toolbar.hidden);
+    // On a touch screen the column keeps the eight slots a tablet needs at hand, in one group, and
+    // its "..." button below opens the rest (`tool_grid`).
+    let sections: Vec<Vec<(usize, Vec<Tool>)>> =
+        if cfg!(target_os = "android") { vec![sections.into_iter().flatten().filter(|(i, _)| TOUCH_SLOTS.contains(i)).collect()] } else { sections };"""
+
+fix_source("crates/ui-egui/src/panels.rs", COL_ANCHOR, COL, "the column keeping the basics")
+
+# ---- And its "..." button opens them, instead of a dialog written for a mouse.
+
+ELL = chr(0x2026)
+
+DOTS_ANCHOR = (
+    '                    if icons::button(ui, "ellipsis", bx, false, tl!("Edit Toolbar' + ELL + '")).clicked() {\n'
+    '                        let _ = crate::menus::invoke(app, &ctx, "edit.toolbar", json!({}));\n'
+    '                    }'
+)
+
+DOTS = (
+    '                    let dots_tip = if cfg!(target_os = "android") { tl!("All Tools") } else { tl!("Edit Toolbar' + ELL + '") };\n'
+    '                    if icons::button(ui, "ellipsis", bx, tool_grid_open(&ctx), dots_tip).clicked() {\n'
+    '                        if cfg!(target_os = "android") {\n'
+    '                            // A second tap closes it, like every other panel on a touch screen.\n'
+    '                            set_tool_grid_open(&ctx, !tool_grid_open(&ctx));\n'
+    '                        } else {\n'
+    '                            let _ = crate::menus::invoke(app, &ctx, "edit.toolbar", json!({}));\n'
+    '                        }\n'
+    '                    }'
+)
+
+fix_source("crates/ui-egui/src/panels.rs", DOTS_ANCHOR, DOTS, "the ... button opening the grid")
+
+# ---- Drawn over the canvas, with the other floating panels.
+
+# Anchored on its own line, away from the other floating panels this script inserts, so each
+# section's guard keeps matching when the next one runs (the script must be replayable).
+CALL_ANCHOR = """        preset_panels::windows(self, &ctx);"""
+
+CALL = """        preset_panels::windows(self, &ctx);
+        panels::tool_grid(self, &ctx);"""
+
+fix_source("crates/ui-egui/src/lib.rs", CALL_ANCHOR, CALL, "the grid drawn over the canvas")
+
+if missing:
+    print(f"  Could not patch the tool grid for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the tool grid for {app}: {', '.join(fixed)}")
 PY
 fi
 
