@@ -2805,7 +2805,7 @@ pub(crate) fn ask_and_install_folder(app: &mut PhotocraftApp) -> Result<serde_js
     // Android copies the folder's fonts before the app hears back, with no way to show it.
     app.ui.status = "Choisis un dossier : la recherche des polices peut durer un moment.".into();
     app.ui.status_error = false;
-    app.ask_file(request, |app, answer| {
+    app.ask_file(request, |_app, answer| {
         let FileDialogAnswer::Paths(paths) = answer else { return Err("Aucune police dans ce dossier.".into()) };
         let job = std::sync::Arc::new(FolderInstall { total: paths.len(), done: Default::default(), result: Mutex::new(None) });
         *FOLDER_INSTALL.lock().unwrap_or_else(PoisonError::into_inner) = Some(job.clone());
@@ -3705,12 +3705,17 @@ OLD = """        self.control_click.normalize(&mut raw_input.events, cfg!(target
 """
 NEW = """        self.control_click.normalize(&mut raw_input.events, cfg!(target_os = "macos"));
         if cfg!(target_os = "android") && self.ui.text_edit.is_none() && ctx.text_edit_focused() {
-            let modifiers = raw_input.modifiers;
             let events = std::mem::take(&mut raw_input.events);
             for event in events {
                 if matches!(event, egui::Event::Ime(egui::ImeEvent::DeleteSurrounding { before_chars: 1, after_chars: 0 })) {
                     for pressed in [true, false] {
-                        raw_input.events.push(egui::Event::Key { key: egui::Key::Backspace, physical_key: None, pressed, repeat: false, modifiers });
+                        raw_input.events.push(egui::Event::Key {
+                            key: egui::Key::Backspace,
+                            physical_key: None,
+                            pressed,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        });
                     }
                 } else {
                     raw_input.events.push(event);
