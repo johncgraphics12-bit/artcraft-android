@@ -2786,24 +2786,84 @@ pub(crate) fn ask_and_install(app: &mut PhotocraftApp) -> Result<serde_json::Val
     })
 }
 
+/// A folder of fonts being installed in the background.
+struct FolderInstall {
+    total: usize,
+    done: std::sync::atomic::AtomicUsize,
+    /// The families, the refused count and whether a copy failed, once every file has been read.
+    result: Mutex<Option<(Vec<String>, usize, bool)>>,
+}
+
+static FOLDER_INSTALL: Mutex<Option<std::sync::Arc<FolderInstall>>> = Mutex::new(None);
+
 /// Type > install a folder of fonts. The Activity sees this mark in place of a list of extensions,
-/// asks for a folder instead of files, and answers with every font file under it, staged as files:
-/// the adapter's Open path carries that answer unchanged, so no new request type is needed.
+/// asks for a folder instead of files, and answers with every font file under it, staged as files.
+/// A folder can hold thousands: they are read on their own thread, so the app stays usable.
 pub(crate) fn ask_and_install_folder(app: &mut PhotocraftApp) -> Result<serde_json::Value, String> {
     use crate::file_dialog::{FileDialogAnswer, FileDialogRequest};
     let request = FileDialogRequest::Open { multiple: true, initial_dir: None, extensions: Some(vec!["__fontfolder__".to_string()]) };
+    // Android copies the folder's fonts before the app hears back, with no way to show it.
+    app.ui.status = "Choisis un dossier : la recherche des polices peut durer un moment.".into();
+    app.ui.status_error = false;
     app.ask_file(request, |app, answer| {
-        let FileDialogAnswer::Paths(paths) = answer else { return install_user_fonts(app, Vec::new()) };
-        let files: Vec<(String, Vec<u8>)> = paths
-            .into_iter()
-            .filter_map(|path| {
-                let bytes = photocraft_format::read_file(std::path::Path::new(&path)).ok()?;
-                Some((path, bytes))
-            })
-            .flat_map(|(name, bytes)| fonts_of_file(name, bytes))
-            .collect();
-        install_user_fonts(app, files)
+        let FileDialogAnswer::Paths(paths) = answer else { return Err("Aucune police dans ce dossier.".into()) };
+        let job = std::sync::Arc::new(FolderInstall { total: paths.len(), done: Default::default(), result: Mutex::new(None) });
+        *FOLDER_INSTALL.lock().unwrap_or_else(PoisonError::into_inner) = Some(job.clone());
+        let total = job.total;
+        std::thread::spawn(move || {
+            let dir = std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".fonts").join("installed"));
+            let mut families: Vec<String> = Vec::new();
+            let mut refused = 0usize;
+            let mut unsaved = dir.is_none();
+            for path in paths {
+                match photocraft_format::read_file(std::path::Path::new(&path)) {
+                    Ok(bytes) => {
+                        for (name, bytes) in fonts_of_file(path, bytes) {
+                            // Held for one font at a time: the screen keeps drawing text between two.
+                            let added = photocraft_text::shared().lock().unwrap_or_else(PoisonError::into_inner).fonts.register_font_data(bytes.clone());
+                            if added.is_empty() {
+                                refused += 1;
+                                continue;
+                            }
+                            if let Some(dir) = &dir
+                                && keep_font_file(dir, &name, &bytes).is_err()
+                            {
+                                unsaved = true;
+                            }
+                            for family in added {
+                                if !families.contains(&family) {
+                                    families.push(family);
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => refused += 1,
+                }
+                job.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            *job.result.lock().unwrap_or_else(PoisonError::into_inner) = Some((families, refused, unsaved));
+        });
+        Ok(serde_json::json!({ "started": total }))
     })
+}
+
+/// Every frame: the progress of a folder being installed, then its result.
+pub(crate) fn poll_folder_install(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    let job = FOLDER_INSTALL.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let Some(job) = job else { return };
+    let finished = job.result.lock().unwrap_or_else(PoisonError::into_inner).take();
+    let Some((families, refused, unsaved)) = finished else {
+        let done = job.done.load(std::sync::atomic::Ordering::Relaxed);
+        app.ui.status = format!("Installation des polices : {done} / {}", job.total);
+        app.ui.status_error = false;
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        return;
+    };
+    *FOLDER_INSTALL.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    if let Err(e) = finish_install(app, families, refused, unsaved) {
+        app.ui.status = e;
+        app.ui.status_error = true;
+    }
 }
 
 /// The fonts a picked file holds: itself, or what a zip archive carries (most fonts are downloaded
@@ -2902,6 +2962,11 @@ fn install_user_fonts(app: &mut PhotocraftApp, files: Vec<(String, Vec<u8>)>) ->
             }
         }
     }
+    finish_install(app, families, refused, unsaved)
+}
+
+/// What is left once the fonts are registered: draw waiting text again, and say what happened.
+fn finish_install(app: &mut PhotocraftApp, families: Vec<String>, refused: usize, unsaved: bool) -> Result<serde_json::Value, String> {
     if families.is_empty() {
         return Err("Aucune police install@E@e : choisis des polices .ttf, .otf, .ttc ou .otc, ou un .zip qui en contient".into());
     }
@@ -2922,7 +2987,8 @@ fn install_user_fonts(app: &mut PhotocraftApp, files: Vec<(String, Vec<u8>)>) ->
         let busy = app.session.refresh_type_layers(&layers);
         PENDING.lock().unwrap_or_else(PoisonError::into_inner).extend(busy);
     }
-    let mut status = format!("Install@E@e : {}", families.join(", "));
+    let mut status =
+        if families.len() > 5 { format!("{} familles de polices install@E@es", families.len()) } else { format!("Install@E@e : {}", families.join(", ")) };
     if refused > 0 {
         status.push_str(&format!(" ({refused} fichier(s) refus@E@(s), ce ne sont pas des polices)"));
     }
@@ -3597,5 +3663,119 @@ if missing:
     sys.exit(1)
 if fixed:
     print(f"  Patched the upright layout for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 24. Backspace over a selection, artboards from New Document, the font folder's progress (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+L = "crates/ui-egui/src/lib.rs"
+
+# The soft keyboard's Backspace arrives as "delete one character before the caret", and egui's text
+# field obeys that literally: a selected name lost its characters one at a time, from the start of
+# the selection. As a Backspace key the field erases the selection, or one character if there is none.
+# The Type tool reads the first form itself and already handles a selection. The key is only made
+# while a text field has the focus, so it can never reach the shortcut that deletes a layer.
+OLD = """        self.control_click.normalize(&mut raw_input.events, cfg!(target_os = "macos"));
+"""
+NEW = """        self.control_click.normalize(&mut raw_input.events, cfg!(target_os = "macos"));
+        if cfg!(target_os = "android") && self.ui.text_edit.is_none() && ctx.text_edit_focused() {
+            let modifiers = raw_input.modifiers;
+            let events = std::mem::take(&mut raw_input.events);
+            for event in events {
+                if matches!(event, egui::Event::Ime(egui::ImeEvent::DeleteSurrounding { before_chars: 1, after_chars: 0 })) {
+                    for pressed in [true, false] {
+                        raw_input.events.push(egui::Event::Key { key: egui::Key::Backspace, physical_key: None, pressed, repeat: false, modifiers });
+                    }
+                } else {
+                    raw_input.events.push(event);
+                }
+            }
+        }
+"""
+fix_source(L, OLD, NEW, "Backspace erasing a selection")
+
+OLD = """        panels::touch_cutout_bar(self, &ctx);
+"""
+NEW = """        served_fonts::poll_folder_install(self, &ctx);
+        panels::touch_cutout_bar(self, &ctx);
+"""
+fix_source(L, OLD, NEW, "the font folder's progress")
+
+# Photoshop's Artboards box. The field's name starts with __, so it never reaches file.new or a saved preset.
+OLD = """            ui.add_space(4.0);
+            small_label(ui, tl!("Background Contents"));
+"""
+NEW = """            ui.add_space(4.0);
+            let mut boards = f.get("__artboard").and_then(Value::as_bool).unwrap_or(false);
+            let before = boards;
+            crate::widgets::checkbox(ui, &mut boards, "Plan de travail");
+            if boards != before {
+                f.insert("__artboard".into(), json!(boards));
+            }
+            ui.add_space(4.0);
+            small_label(ui, tl!("Background Contents"));
+"""
+fix_source("crates/ui-egui/src/new_doc_ui.rs", OLD, NEW, "the Artboard box")
+
+# The document then holds one board of its own size and nothing under it, with the tool whose "+"
+# buttons add the next board in hand.
+OLD = """            let r = app.run("file.new", crate::new_doc_ui::command_params(&d.fields));
+"""
+NEW = """            let r = app.run("file.new", crate::new_doc_ui::command_params(&d.fields));
+            if r.is_ok() && d.fields.get("__artboard").and_then(Value::as_bool) == Some(true) {
+                let background = match d.fields.get("background").and_then(Value::as_str) {
+                    Some("black") => "black",
+                    Some("transparent") => "transparent",
+                    _ => "white",
+                };
+                if app.run("layer.new.artboard", json!({"background": background})).is_ok() {
+                    let under: Vec<u64> =
+                        app.session.active().map_or_else(Vec::new, |st| st.doc.layers.iter().filter(|l| l.artboard().is_none()).map(|l| l.id.0).collect());
+                    for layer in under {
+                        let _ = app.run("layer.delete", json!({"layer": layer}));
+                    }
+                    app.ui.tool = crate::state::Tool::Artboard;
+                }
+            }
+"""
+fix_source("crates/ui-egui/src/dialogs.rs", OLD, NEW, "the document starting with an artboard")
+
+# A mouse can hit 8 points; a finger cannot.
+A = "crates/ui-egui/src/artboard_tool.rs"
+fix_source(A, "const HANDLE_PX: f64 = 6.0;", 'const HANDLE_PX: f64 = if cfg!(target_os = "android") { 16.0 } else { 6.0 };', "board handles for a finger")
+fix_source(A, "const PLUS_OFFSET_PX: f64 = 18.0;", 'const PLUS_OFFSET_PX: f64 = if cfg!(target_os = "android") { 34.0 } else { 18.0 };', "board + buttons further out")
+fix_source(A, "const PLUS_RADIUS_PX: f64 = 8.0;", 'const PLUS_RADIUS_PX: f64 = if cfg!(target_os = "android") { 18.0 } else { 8.0 };', "board + buttons for a finger")
+
+if missing:
+    print(f"  Could not patch section 24 for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched section 24 for {app}: {', '.join(fixed)}")
 PY
 fi
