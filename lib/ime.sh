@@ -2099,6 +2099,10 @@ pub fn apply_touch_modifiers(app: &mut PhotocraftApp, ctx: &egui::Context, raw: 
 
 /// One of the block's buttons: plain when off, outlined in the accent when armed for the next
 /// gesture, filled when locked.
+fn touch_mods_open_id() -> egui::Id {
+    egui::Id::new("touch-mods-open")
+}
+
 fn touch_mod_button(ui: &mut egui::Ui, label: &str, state: Sticky) -> egui::Response {
     let t = Tokens::get(ui.ctx());
     let (rect, resp) = ui.allocate_exact_size(vec2(TOUCH_MOD_W, TOUCH_MOD_BTN), Sense::click());
@@ -2115,7 +2119,8 @@ fn touch_mod_button(ui: &mut egui::Ui, label: &str, state: Sticky) -> egui::Resp
     resp
 }
 
-/// Shift, Alt and Ctrl floating over the canvas, for a screen with no keyboard (Android).
+/// Shift and Alt floating over the canvas, for a screen with no keyboard (Android). Folded to one
+/// small button until asked for, and open by itself on the two tools that cannot work without Alt.
 ///
 /// One tap arms a modifier for the next gesture, a second locks it, a third clears it -- so a
 /// single finger can subtract from a selection, and a long piece of work that needs the same
@@ -2132,14 +2137,21 @@ pub fn touch_modifiers(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let t = Tokens::get(ctx);
     let state = touch_mods(ctx);
     let offset: egui::Vec2 = ctx.data(|d| d.get_temp(touch_mods_offset_id())).unwrap_or_default();
-    let pos = pos2(canvas.left() + 12.0, canvas.bottom() - TOUCH_MOD_H - 12.0) + offset;
+    // Above the cutout bar while that is up, so neither covers the other.
+    let lift = ctx.data(|d| d.get_temp::<f32>(touch_cutout_lift_id())).unwrap_or(0.0);
+    let pos = pos2(canvas.left() + 12.0, canvas.bottom() - TOUCH_MOD_H - 12.0 - lift) + offset;
     let frame = egui::Frame::NONE
         .fill(t.dock)
         .stroke(Stroke::new(1.0, t.card_border))
         .corner_radius(CornerRadius::same(t.radius_lg as u8))
         .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: t.shadow })
         .inner_margin(egui::Margin::same(6));
-    let labels = [crate::shortcuts::pretty("Shift"), crate::shortcuts::pretty("Alt"), crate::shortcuts::pretty("Ctrl")];
+    let labels = [crate::shortcuts::pretty("Shift"), crate::shortcuts::pretty("Alt")];
+    // The Clone Stamp and the Healing Brush take their source from an Alt-tap.
+    let needs_alt = matches!(app.ui.tool, Tool::CloneStamp | Tool::Healing);
+    let wanted = ctx.data(|d| d.get_temp::<bool>(touch_mods_open_id())).unwrap_or(false);
+    let open = wanted || needs_alt;
+    let mut wanted_next = wanted;
     let mut next = state;
     let mut drag = egui::Vec2::ZERO;
     // Order::Middle, like the other floating panels, so menus and dialogs stay above it.
@@ -2159,14 +2171,21 @@ pub fn touch_modifiers(app: &mut PhotocraftApp, ctx: &egui::Context) {
                         ui.painter().circle_filled(pos2(x, y), 1.4, t.text_faint);
                     }
                 }
-                for (i, label) in labels.iter().enumerate() {
-                    if touch_mod_button(ui, label, state[i]).clicked() {
-                        next[i] = match state[i] {
-                            Sticky::Off => Sticky::Armed,
-                            Sticky::Armed => Sticky::Locked,
-                            Sticky::Locked => Sticky::Off,
-                        };
+                if open {
+                    for (i, label) in labels.iter().enumerate() {
+                        if touch_mod_button(ui, label, state[i]).clicked() {
+                            next[i] = match state[i] {
+                                Sticky::Off => Sticky::Armed,
+                                Sticky::Armed => Sticky::Locked,
+                                Sticky::Locked => Sticky::Off,
+                            };
+                        }
                     }
+                    if !needs_alt && icons::button(ui, "x", TOUCH_MOD_BTN, false, "").clicked() {
+                        wanted_next = false;
+                    }
+                } else if touch_mod_button(ui, "Maj/Alt", Sticky::Off).clicked() {
+                    wanted_next = true;
                 }
             });
         });
@@ -2179,6 +2198,13 @@ pub fn touch_modifiers(app: &mut PhotocraftApp, ctx: &egui::Context) {
         let dx = (canvas.left() - r.left()).max(0.0) - (r.right() - canvas.right()).max(0.0);
         let dy = (canvas.top() - r.top()).max(0.0) - (r.bottom() - canvas.bottom()).max(0.0);
         ctx.data_mut(|d| d.insert_temp(touch_mods_offset_id(), offset + drag + vec2(dx, dy)));
+    }
+    if wanted_next != wanted {
+        ctx.data_mut(|d| d.insert_temp(touch_mods_open_id(), wanted_next));
+    }
+    // A folded block holds nothing: no modifier stays on with no button to show it.
+    if !(wanted_next || needs_alt) {
+        next = [Sticky::Off; 3];
     }
     if next != state {
         set_touch_mods(ctx, next);
@@ -2682,3 +2708,414 @@ if fixed:
 PY
 fi
 
+
+# --------------------------- 18. installing fonts from inside the app (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+ELL = chr(0x2026)
+E = chr(0xE9)
+
+# Nothing in PhotoCraft installs a font: on Android the only way in was a Fonts folder at the root
+# of the storage plus "all files access" plus a restart, and nothing in the app says so. This adds
+# Type > Installer des polices... : the chosen files are registered at once (the font menus follow
+# the shared generation) and copied to the app's own storage, which needs no permission. The copy
+# sits in a subfolder of $HOME/.fonts because system_font_dirs() walks subfolders and the launcher's
+# link_fonts() replaces same-named entries of that folder itself: a font named like a system font
+# would otherwise be lost at the next start.
+
+ANCHOR = "/// Does the layer use one of `families`, by name or through the PostScript name a PSD gave?"
+
+INSTALL = """/// Type > install fonts: ask for font files, whatever their type (a font's MIME type is unreliable
+/// on Android, so the files themselves are the test).
+pub(crate) fn ask_and_install(app: &mut PhotocraftApp) -> Result<serde_json::Value, String> {
+    use crate::file_dialog::{FileDialogAnswer, FileDialogRequest};
+    let request = FileDialogRequest::Open { multiple: true, initial_dir: None, extensions: None };
+    app.ask_file(request, |app, answer| {
+        let files: Vec<(String, Vec<u8>)> = match answer {
+            FileDialogAnswer::Contents(name, bytes) => vec![(name, bytes)],
+            FileDialogAnswer::ContentsMany(files) => files,
+            FileDialogAnswer::Paths(paths) => paths
+                .into_iter()
+                .filter_map(|path| {
+                    let bytes = photocraft_format::read_file(std::path::Path::new(&path)).ok()?;
+                    Some((path, bytes))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        install_user_fonts(app, files.into_iter().flat_map(|(name, bytes)| fonts_of_file(name, bytes)).collect())
+    })
+}
+
+/// The fonts a picked file holds: itself, or what a zip archive carries (most fonts are downloaded
+/// as a zip). An archive with none stays as it is, to be counted as refused.
+fn fonts_of_file(name: String, bytes: Vec<u8>) -> Vec<(String, Vec<u8>)> {
+    if bytes.starts_with(&[0x50, 0x4b, 3, 4]) {
+        let inner = fonts_in_zip(&bytes);
+        if !inner.is_empty() {
+            return inner;
+        }
+    }
+    vec![(name, bytes)]
+}
+
+/// Reads a zip's central directory by hand: flate2 is already linked, and only two storage methods
+/// exist in practice. A damaged entry is skipped, not an error.
+fn fonts_in_zip(zip: &[u8]) -> Vec<(String, Vec<u8>)> {
+    use std::io::Read;
+    const MAX_FONT_BYTES: u64 = 64 * 1024 * 1024;
+    let u16_at = |at: usize| zip.get(at..at + 2).map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])));
+    let u32_at = |at: usize| zip.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let mut fonts = Vec::new();
+    let Some(end) = zip.windows(4).rposition(|w| w == [0x50, 0x4b, 5, 6]) else { return fonts };
+    let (Some(count), Some(mut at)) = (u16_at(end + 10), u32_at(end + 16)) else { return fonts };
+    for _ in 0..count {
+        if zip.get(at..at + 4) != Some(&[0x50, 0x4b, 1, 2][..]) {
+            break;
+        }
+        let (Some(method), Some(packed), Some(name_len), Some(extra), Some(comment), Some(local)) =
+            (u16_at(at + 10), u32_at(at + 20), u16_at(at + 28), u16_at(at + 30), u16_at(at + 32), u32_at(at + 42))
+        else {
+            break;
+        };
+        let name = zip.get(at + 46..at + 46 + name_len).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+        at += 46 + name_len + extra + comment;
+        let lower = name.to_lowercase();
+        if lower.contains("__macosx") || ![".ttf", ".otf", ".ttc", ".otc"].iter().any(|e| lower.ends_with(e)) {
+            continue;
+        }
+        let (Some(local_name), Some(local_extra)) = (u16_at(local + 26), u16_at(local + 28)) else { continue };
+        let start = local + 30 + local_name + local_extra;
+        let Some(data) = zip.get(start..start.saturating_add(packed)) else { continue };
+        let mut out = Vec::new();
+        let read = match method {
+            0 => data.take(MAX_FONT_BYTES).read_to_end(&mut out).is_ok(),
+            8 => flate2::read::DeflateDecoder::new(data).take(MAX_FONT_BYTES).read_to_end(&mut out).is_ok(),
+            _ => false,
+        };
+        if read {
+            fonts.push((name, out));
+        }
+    }
+    fonts
+}
+
+/// Keep a font for the next start, in a folder the font scan walks.
+fn keep_font_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let stem: String = std::path::Path::new(name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().chars().filter(|c| c.is_alphanumeric() || matches!(*c, '-' | '_' | ' ')).collect())
+        .unwrap_or_default();
+    let stem = if stem.is_empty() { format!("font-{}", bytes.len()) } else { stem };
+    // The scan goes by extension, and a picked file does not always keep its own.
+    let ext = match bytes.get(..4) {
+        Some(b"OTTO") => "otf",
+        Some(b"ttcf") => "ttc",
+        _ => "ttf",
+    };
+    std::fs::write(dir.join(format!("{stem}.{ext}")), bytes)
+}
+
+fn install_user_fonts(app: &mut PhotocraftApp, files: Vec<(String, Vec<u8>)>) -> Result<serde_json::Value, String> {
+    let dir = std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".fonts").join("installed"));
+    let mut families: Vec<String> = Vec::new();
+    let mut refused = 0usize;
+    let mut unsaved = dir.is_none();
+    {
+        let mut eng = photocraft_text::shared().lock().unwrap_or_else(PoisonError::into_inner);
+        for (name, bytes) in files {
+            let added = eng.fonts.register_font_data(bytes.clone());
+            if added.is_empty() {
+                refused += 1;
+                continue;
+            }
+            if let Some(dir) = &dir
+                && let Err(e) = keep_font_file(dir, &name, &bytes)
+            {
+                log::warn!("could not keep the font {name}: {e}");
+                unsaved = true;
+            }
+            for family in added {
+                if !families.contains(&family) {
+                    families.push(family);
+                }
+            }
+        }
+    }
+    if families.is_empty() {
+        return Err("Aucune police install@E@e : choisis des polices .ttf, .otf, .ttc ou .otc, ou un .zip qui en contient".into());
+    }
+    // Text already waiting for one of these families is drawn again, as when a served font arrives.
+    let mut layers: Vec<(DocId, LayerId)> = Vec::new();
+    for st in app.session.documents() {
+        for (_, _, l) in st.doc.walk() {
+            if let LayerContent::Text(t) = &l.content
+                && uses_family(t, &families)
+                && crate::type_tool::shows_own_layout(&st.doc, t)
+                && !layers.contains(&(st.doc.id, l.id))
+            {
+                layers.push((st.doc.id, l.id));
+            }
+        }
+    }
+    if !layers.is_empty() {
+        let busy = app.session.refresh_type_layers(&layers);
+        PENDING.lock().unwrap_or_else(PoisonError::into_inner).extend(busy);
+    }
+    let mut status = format!("Install@E@e : {}", families.join(", "));
+    if refused > 0 {
+        status.push_str(&format!(" ({refused} fichier(s) refus@E@(s), ce ne sont pas des polices)"));
+    }
+    if unsaved {
+        status.push_str(" (pour cette session seulement : copie impossible)");
+    }
+    app.ui.status = status;
+    app.ui.status_error = refused > 0 || unsaved;
+    Ok(serde_json::json!({ "families": families, "refused": refused }))
+}
+
+""".replace("@E@", E)
+
+fix_source("crates/ui-egui/src/served_fonts.rs", ANCHOR, INSTALL + ANCHOR, "the font installer")
+
+ROW_ANCHOR = '    (&["Type"], "Resolve Missing Fonts' + ELL + '", None, "type.resolveMissingFonts"),'
+ROW = ROW_ANCHOR + '\n    (&["Type"], "Installer des polices' + ELL + '", None, "type.installFonts"),'
+fix_source("crates/ui-egui/src/menu_catalog.rs", ROW_ANCHOR, ROW, "the Type menu entry")
+
+RUN_ANCHOR = """        "select.selectAndMask" => Ok(json!({"dialog": crate::filter_dialog::open(app, "select.refineEdge")})),"""
+RUN = """        "type.installFonts" => crate::served_fonts::ask_and_install(app),\n""" + RUN_ANCHOR
+fix_source("crates/ui-egui/src/menus.rs", RUN_ANCHOR, RUN, "the menu entry's action")
+
+ON_ANCHOR = """        "select.selectAndMask" => app.session.is_enabled("select.refineEdge"),"""
+ON = """        "type.installFonts" => true,\n""" + ON_ANCHOR
+fix_source("crates/ui-egui/src/menus.rs", ON_ANCHOR, ON, "the menu entry enabled")
+
+# A menu row only goes live once the shell declares its command.
+SHELL_ANCHOR = """    ("type.editText", "Edit Type", &[], None),"""
+SHELL = """    ("type.installFonts", "Installer des polices""" + ELL + """", &["Type"], None),
+""" + SHELL_ANCHOR
+fix_source("crates/engine/src/shell_commands.rs", SHELL_ANCHOR, SHELL, "the command declared to the shell")
+
+# The same action where a font is chosen: the Character panel, under the rail on a tablet.
+PANEL_ANCHOR = """        let mut fam = c.font_family.clone();
+        let mut ready = true;
+        row(ui, &mut |ui| {
+            ready = fonts_ready(ui, full);"""
+PANEL = """        if cfg!(target_os = "android") && crate::widgets::secondary_button(ui, "Installer des polices""" + ELL + """", full).clicked() {
+            let _ = crate::menus::invoke(app, ui.ctx(), "type.installFonts", json!({}));
+        }
+""" + PANEL_ANCHOR
+fix_source("crates/ui-egui/src/type_tool.rs", PANEL_ANCHOR, PANEL, "the button in the Character panel")
+
+if missing:
+    print(f"  Could not patch the font installer for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the font installer for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 19. a cutout bar a finger can reach (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+ELL = chr(0x2026)
+E = chr(0xE9)
+
+# Subject, Select and Mask and the output to a mask all exist, spread over menus and an options bar
+# written for a mouse. While a selection tool is active this bar puts them in one row above the
+# thumb, as Affinity's context toolbar and Photoshop on iPad's do. It calls the commands the menus
+# call; no selection code changes.
+
+ANCHOR = "/// New / add / subtract / intersect selection buttons (shared by selection tools)."
+
+BAR = """fn touch_cutout_lift_id() -> egui::Id {
+    egui::Id::new("touch-cutout-lift")
+}
+
+fn touch_cutout_text_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
+    let t = Tokens::get(ui.ctx());
+    let fg = if enabled { t.text } else { t.text_faint };
+    let width = ui.painter().layout_no_wrap(label.to_string(), theme::medium(13.0), fg).size().x + 20.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(width.max(44.0), 44.0), Sense::click());
+    ui.painter().rect_filled(rect, t.radius_sm, t.field);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, theme::medium(13.0), fg);
+    enabled && resp.clicked()
+}
+
+/// The cutout controls over the canvas while a selection tool is active (Android).
+pub fn touch_cutout_bar(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    let tool = app.ui.tool;
+    let canvas = app.last_canvas_rect;
+    let shown = cfg!(target_os = "android")
+        && app.ui.docking.is_none()
+        && app.ui.dialogs.is_empty()
+        && app.ui.transform.is_none()
+        && canvas.is_positive()
+        && app.session.active().is_some()
+        && matches!(
+            tool,
+            Tool::RectMarquee
+                | Tool::EllipseMarquee
+                | Tool::Lasso
+                | Tool::PolygonLasso
+                | Tool::MagneticLasso
+                | Tool::MagicWand
+                | Tool::QuickSelection
+                | Tool::ObjectSelection
+        );
+    if !shown {
+        ctx.data_mut(|d| d.insert_temp(touch_cutout_lift_id(), 0.0f32));
+        return;
+    }
+    let t = Tokens::get(ctx);
+    let mode = app.ui.selection_mode;
+    let has_selection = app.session.active().is_some_and(|d| d.doc.selection.is_some());
+    let can_refine = crate::menus::is_enabled(app, "select.selectAndMask");
+    let size = app.session.tools.brush.size;
+    let frame = egui::Frame::NONE
+        .fill(t.dock)
+        .stroke(Stroke::new(1.0, t.card_border))
+        .corner_radius(CornerRadius::same(t.radius_lg as u8))
+        .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: t.shadow })
+        .inner_margin(egui::Margin::same(6));
+    let mut action: Option<&'static str> = None;
+    let width = (canvas.width() - 24.0).max(200.0);
+    let area = egui::Area::new(egui::Id::new("touch-cutout-area"))
+        .order(egui::Order::Middle)
+        .pivot(Align2::CENTER_BOTTOM)
+        .fixed_pos(pos2(canvas.center().x, canvas.bottom() - 12.0))
+        .show(ctx, |ui| {
+            frame.show(ui, |ui| {
+                ui.set_max_width(width);
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if touch_cutout_text_button(ui, "Sujet", true) {
+                        action = Some("subject");
+                    }
+                    for (icon, on, id) in [("square", mode == 0, "new"), ("plus", mode == 1 || mode == 3, "add"), ("minus", mode == 2, "subtract")] {
+                        if icons::button_with_icon_size(ui, icon, 44.0, 20.0, on, "").clicked() {
+                            action = Some(id);
+                        }
+                    }
+                    if tool == Tool::QuickSelection {
+                        if icons::button_with_icon_size(ui, "chevron-down", 44.0, 20.0, false, "").clicked() {
+                            action = Some("smaller");
+                        }
+                        let (value, _) = ui.allocate_exact_size(vec2(36.0, 44.0), Sense::hover());
+                        ui.painter().text(value.center(), Align2::CENTER_CENTER, format!("{size:.0}"), theme::medium(13.0), t.text);
+                        if icons::button_with_icon_size(ui, "chevron-up", 44.0, 20.0, false, "").clicked() {
+                            action = Some("larger");
+                        }
+                    }
+                    if touch_cutout_text_button(ui, "Am@E@liorer le contour", can_refine) {
+                        action = Some("refine");
+                    }
+                    if touch_cutout_text_button(ui, "Masque", has_selection) {
+                        action = Some("mask");
+                    }
+                });
+            });
+        });
+    let lift = area.response.rect.height() + 8.0;
+    ctx.data_mut(|d| d.insert_temp(touch_cutout_lift_id(), lift));
+    match action {
+        Some("subject") => {
+            let result = app.run("select.subject", json!({}));
+            let found = result.is_ok();
+            crate::retouch_ui::report_smart_result(app, result, "Aucun sujet trouv@E@ : essaie la S@E@lection rapide ou le Lasso");
+            // A cutout goes on from the subject: the next stroke corrects it instead of replacing it.
+            if found {
+                app.ui.selection_mode = 1;
+            }
+        }
+        Some("new") => app.ui.selection_mode = 0,
+        Some("add") => app.ui.selection_mode = 1,
+        Some("subtract") => app.ui.selection_mode = 2,
+        Some(step @ ("smaller" | "larger")) => {
+            let before = app.session.tools.brush.clone();
+            let mut brush = before.clone();
+            brush.size = if step == "larger" { (size * 1.25).max(size + 1.0).min(5000.0) } else { (size * 0.8).max(1.0) };
+            crate::brush_panel::commit_gesture(app, ctx, &before, &brush);
+        }
+        Some("refine") => {
+            if let Err(e) = crate::menus::invoke(app, ctx, "select.selectAndMask", json!({})) {
+                app.ui.status = e;
+                app.ui.status_error = true;
+            }
+        }
+        Some("mask") => {
+            if let Err(e) = app.run("select.refineEdge", json!({"output": "layerMask"})) {
+                app.ui.status = e;
+                app.ui.status_error = true;
+            }
+        }
+        _ => {}
+    }
+}
+
+""".replace("@E@", E)
+
+fix_source("crates/ui-egui/src/panels.rs", ANCHOR, BAR + ANCHOR, "the cutout bar")
+
+CALL_ANCHOR = """        dialogs::show(self, &ctx);"""
+CALL = """        panels::touch_cutout_bar(self, &ctx);\n""" + CALL_ANCHOR
+fix_source("crates/ui-egui/src/lib.rs", CALL_ANCHOR, CALL, "the bar drawn over the canvas")
+
+if missing:
+    print(f"  Could not patch the cutout bar for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the cutout bar for {app}: {', '.join(fixed)}")
+PY
+fi
