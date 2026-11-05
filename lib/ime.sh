@@ -1572,6 +1572,20 @@ pub fn touch_panel(app: &mut PhotocraftApp, ctx: &egui::Context) {
         .corner_radius(CornerRadius::same(t.radius_lg as u8))
         .shadow(egui::Shadow { offset: [0, 12], blur: 36, spread: 0, color: t.shadow })
         .inner_margin(egui::Margin::same(12));
+    // A touch on the canvas beside the panel closes it and does nothing else: the sheet takes it
+    // away from the canvas, and the panel goes when the finger comes up. The rail is left alone.
+    if app.last_canvas_rect.is_positive() {
+        let outside = egui::Area::new(egui::Id::new("touch-panel-outside"))
+            .order(egui::Order::Middle)
+            .fixed_pos(canvas.min)
+            .show(ctx, |ui| ui.allocate_response(canvas.size(), Sense::click_and_drag()))
+            .inner;
+        if (outside.clicked() || outside.drag_stopped()) && !egui::Popup::is_any_open(ctx) {
+            set_touch_open(ctx, None);
+        }
+        // Whichever was first seen first, the sheet must stay under the panel.
+        ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, egui::Id::new("touch-panel")));
+    }
     // Order::Middle, like the other floating panels, so menus, popups and dialogs stay above it.
     egui::Area::new(egui::Id::new("touch-panel")).order(egui::Order::Middle).fixed_pos(pos2(x, canvas.top() + 10.0)).show(ctx, |ui| {
         frame.show(ui, |ui| {
@@ -2772,6 +2786,26 @@ pub(crate) fn ask_and_install(app: &mut PhotocraftApp) -> Result<serde_json::Val
     })
 }
 
+/// Type > install a folder of fonts. The Activity sees this mark in place of a list of extensions,
+/// asks for a folder instead of files, and answers with every font file under it, staged as files:
+/// the adapter's Open path carries that answer unchanged, so no new request type is needed.
+pub(crate) fn ask_and_install_folder(app: &mut PhotocraftApp) -> Result<serde_json::Value, String> {
+    use crate::file_dialog::{FileDialogAnswer, FileDialogRequest};
+    let request = FileDialogRequest::Open { multiple: true, initial_dir: None, extensions: Some(vec!["__fontfolder__".to_string()]) };
+    app.ask_file(request, |app, answer| {
+        let FileDialogAnswer::Paths(paths) = answer else { return install_user_fonts(app, Vec::new()) };
+        let files: Vec<(String, Vec<u8>)> = paths
+            .into_iter()
+            .filter_map(|path| {
+                let bytes = photocraft_format::read_file(std::path::Path::new(&path)).ok()?;
+                Some((path, bytes))
+            })
+            .flat_map(|(name, bytes)| fonts_of_file(name, bytes))
+            .collect();
+        install_user_fonts(app, files)
+    })
+}
+
 /// The fonts a picked file holds: itself, or what a zip archive carries (most fonts are downloaded
 /// as a zip). An archive with none stays as it is, to be counted as refused.
 fn fonts_of_file(name: String, bytes: Vec<u8>) -> Vec<(String, Vec<u8>)> {
@@ -2905,20 +2939,21 @@ fn install_user_fonts(app: &mut PhotocraftApp, files: Vec<(String, Vec<u8>)>) ->
 fix_source("crates/ui-egui/src/served_fonts.rs", ANCHOR, INSTALL + ANCHOR, "the font installer")
 
 ROW_ANCHOR = '    (&["Type"], "Resolve Missing Fonts' + ELL + '", None, "type.resolveMissingFonts"),'
-ROW = ROW_ANCHOR + '\n    (&["Type"], "Installer des polices' + ELL + '", None, "type.installFonts"),'
+ROW = ROW_ANCHOR + '\n    (&["Type"], "Installer des polices' + ELL + '", None, "type.installFonts"),\n    (&["Type"], "Installer un dossier de polices' + ELL + '", None, "type.installFontFolder"),'
 fix_source("crates/ui-egui/src/menu_catalog.rs", ROW_ANCHOR, ROW, "the Type menu entry")
 
 RUN_ANCHOR = """        "select.selectAndMask" => Ok(json!({"dialog": crate::filter_dialog::open(app, "select.refineEdge")})),"""
-RUN = """        "type.installFonts" => crate::served_fonts::ask_and_install(app),\n""" + RUN_ANCHOR
+RUN = """        "type.installFonts" => crate::served_fonts::ask_and_install(app),\n        "type.installFontFolder" => crate::served_fonts::ask_and_install_folder(app),\n""" + RUN_ANCHOR
 fix_source("crates/ui-egui/src/menus.rs", RUN_ANCHOR, RUN, "the menu entry's action")
 
 ON_ANCHOR = """        "select.selectAndMask" => app.session.is_enabled("select.refineEdge"),"""
-ON = """        "type.installFonts" => true,\n""" + ON_ANCHOR
+ON = """        "type.installFonts" => true,\n        "type.installFontFolder" => true,\n""" + ON_ANCHOR
 fix_source("crates/ui-egui/src/menus.rs", ON_ANCHOR, ON, "the menu entry enabled")
 
 # A menu row only goes live once the shell declares its command.
 SHELL_ANCHOR = """    ("type.editText", "Edit Type", &[], None),"""
 SHELL = """    ("type.installFonts", "Installer des polices""" + ELL + """", &["Type"], None),
+    ("type.installFontFolder", "Installer un dossier de polices""" + ELL + """", &["Type"], None),
 """ + SHELL_ANCHOR
 fix_source("crates/engine/src/shell_commands.rs", SHELL_ANCHOR, SHELL, "the command declared to the shell")
 
@@ -2929,6 +2964,9 @@ PANEL_ANCHOR = """        let mut fam = c.font_family.clone();
             ready = fonts_ready(ui, full);"""
 PANEL = """        if cfg!(target_os = "android") && crate::widgets::secondary_button(ui, "Installer des polices""" + ELL + """", full).clicked() {
             let _ = crate::menus::invoke(app, ui.ctx(), "type.installFonts", json!({}));
+        }
+        if cfg!(target_os = "android") && crate::widgets::secondary_button(ui, "Installer un dossier de polices""" + ELL + """", full).clicked() {
+            let _ = crate::menus::invoke(app, ui.ctx(), "type.installFontFolder", json!({}));
         }
 """ + PANEL_ANCHOR
 fix_source("crates/ui-egui/src/type_tool.rs", PANEL_ANCHOR, PANEL, "the button in the Character panel")
@@ -3117,5 +3155,447 @@ if missing:
     sys.exit(1)
 if fixed:
     print(f"  Patched the cutout bar for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 20. Quick Selection growing while the stroke is drawn (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+# The whole stroke used to be cut once, at the release: nothing showed while drawing. Now each new
+# stretch of the stroke is cut as it comes and added to the selection, in one history step. The next
+# cut waits for twice what the last one took, so a heavy image updates less often instead of
+# freezing the finger.
+
+R = "crates/ui-egui/src/retouch_ui.rs"
+FINISH_OLD = """/// Finish a stroke with a retouching tool. Returns false if `tool` isn't one.
+pub fn finish_stroke(app: &mut PhotocraftApp, tool: Tool, points: &[[f64; 3]], mods: egui::Modifiers) -> bool {
+"""
+FINISH_NEW = """/// A Quick Selection stroke being cut while it is drawn.
+struct QuickLive {
+    first: [f64; 2],
+    /// How many of the stroke's points have been cut.
+    done: usize,
+    /// The mode of the next cut: after New, the stroke adds to its own first cut.
+    mode: &'static str,
+    /// One history step for the whole stroke.
+    key: String,
+    /// Not before this: the time the last cut took, twice over, is left to the finger.
+    next: std::time::Instant,
+}
+
+thread_local! {
+    static QUICK_LIVE: std::cell::RefCell<Option<QuickLive>> = const { std::cell::RefCell::new(None) };
+    static QUICK_STROKES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn quick_cut(app: &mut PhotocraftApp, points: &[[f64; 3]], mode: &str, key: &str, enhance: bool) -> Result<Value, String> {
+    let xy: Vec<[f64; 2]> = points.iter().map(|q| [q[0], q[1]]).collect();
+    let size = app.session.tools.brush.size;
+    let sample_all = app.ui.tool_options.sample_all.quick_selection;
+    app.run("select.quick", json!({"points": xy, "size": size, "mode": mode, "enhanceEdge": enhance, "sampleAllLayers": sample_all, "coalesce": key}))
+}
+
+/// Called on every move of a stroke: cuts the stretch drawn since the last cut when it is long enough.
+pub fn quick_live_step(app: &mut PhotocraftApp) {
+    let Some(d) = app.drag.as_ref().filter(|d| d.tool == Tool::QuickSelection && d.points.len() >= 2) else { return };
+    let first = [d.points[0][0], d.points[0][1]];
+    let total = d.points.len();
+    let alt = d.modifiers.alt;
+    let state = QUICK_LIVE.with(|s| s.borrow_mut().take()).filter(|s| s.first == first && s.done <= total);
+    let done = state.as_ref().map_or(0, |s| s.done);
+    let tail: Vec<[f64; 3]> = d.points[done.saturating_sub(1)..].to_vec();
+    let walked: f64 = tail.windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).sum();
+    let size = f64::from(app.session.tools.brush.size);
+    let began = std::time::Instant::now();
+    if walked < (size * 0.25).max(4.0) || state.as_ref().is_some_and(|s| began < s.next) {
+        QUICK_LIVE.with(|s| *s.borrow_mut() = state);
+        return;
+    }
+    let (mode, key) = match state {
+        Some(s) => (s.mode, s.key),
+        None => {
+            let mode = if alt {
+                "subtract"
+            } else {
+                match app.ui.selection_mode {
+                    0 => "new",
+                    2 => "subtract",
+                    _ => "add",
+                }
+            };
+            let stroke = QUICK_STROKES.with(|c| {
+                c.set(c.get() + 1);
+                c.get()
+            });
+            (mode, format!("quick-live-{stroke}"))
+        }
+    };
+    // Auto-Enhance is too slow for this; it runs once, at the release.
+    let _ = quick_cut(app, &tail, mode, &key, false);
+    if mode == "new" {
+        app.ui.selection_mode = 1;
+    }
+    let later = if mode == "subtract" { "subtract" } else { "add" };
+    let rest = (began.elapsed() * 2).max(std::time::Duration::from_millis(60));
+    let next = std::time::Instant::now() + rest;
+    QUICK_LIVE.with(|s| *s.borrow_mut() = Some(QuickLive { first, done: total, mode: later, key, next }));
+}
+
+/// The release of a stroke already being cut: only what is left is cut. False: no cut was made yet,
+/// and the stroke is cut whole, as a tap is.
+fn quick_live_finish(app: &mut PhotocraftApp, points: &[[f64; 3]]) -> bool {
+    let Some(first) = points.first().map(|p| [p[0], p[1]]) else { return false };
+    let Some(s) = QUICK_LIVE.with(|c| c.borrow_mut().take()).filter(|s| s.first == first && s.done <= points.len()) else { return false };
+    let enhance = app.ui.tool_options.enhance_edge;
+    let rest = &points[s.done.saturating_sub(1)..];
+    if enhance {
+        let _ = quick_cut(app, points, s.mode, &s.key, true);
+    } else if rest.len() >= 2 {
+        let _ = quick_cut(app, rest, s.mode, &s.key, false);
+    }
+    true
+}
+
+/// Finish a stroke with a retouching tool. Returns false if `tool` isn't one.
+pub fn finish_stroke(app: &mut PhotocraftApp, tool: Tool, points: &[[f64; 3]], mods: egui::Modifiers) -> bool {
+    if tool == Tool::QuickSelection && quick_live_finish(app, points) {
+        return true;
+    }
+"""
+fix_source(R, FINISH_OLD, FINISH_NEW, "the stroke cut as it is drawn")
+
+MOVE_OLD = """        if moved || held {
+            d.points.push([x, y, pressure as f64]);
+            app.stylus.record_point();
+        }
+    }
+}
+
+/// Tool state machine. Shared by mouse input and automation.
+"""
+MOVE_NEW = """        if moved || held {
+            d.points.push([x, y, pressure as f64]);
+            app.stylus.record_point();
+        }
+    }
+    crate::retouch_ui::quick_live_step(app);
+}
+
+/// Tool state machine. Shared by mouse input and automation.
+"""
+fix_source("crates/ui-egui/src/canvas.rs", MOVE_OLD, MOVE_NEW, "the cut called on each move")
+
+if missing:
+    print(f"  Could not patch the live Quick Selection for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the live Quick Selection for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 22. the Activity answering a request for a folder of fonts (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+# Android gives a folder as a tree of documents, not a path. The Activity walks the tree and copies
+# each font to a staging folder, then answers like a multiple Open. Stops the build if an anchor has
+# moved: a menu entry that silently does nothing is worse than a failed build.
+
+android_dir = src / "apps" / f"{app}-android"
+activity = None
+for candidate in sorted((android_dir / "java").rglob("*.java")):
+    if "public void pcRequestOpen(long id, boolean multiple, String extensionsStr)" in candidate.read_text(errors="replace"):
+        activity = candidate
+        break
+if activity is None:
+    print(f"  Could not find the Activity for {app}", file=sys.stderr)
+    sys.exit(1)
+rel = str(activity.relative_to(src))
+
+fix_source(rel, """    private static final int REQ_PERMISSIONS = 0x5045;
+""", """    private static final int REQ_PERMISSIONS = 0x5045;
+    private static final int REQ_FONT_TREE = 0x5047;
+""", "the request code")
+
+fix_source(rel, """    public void pcRequestOpen(long id, boolean multiple, String extensionsStr) {
+        runOnUiThread(() -> {
+            try {
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+""", """    public void pcRequestOpen(long id, boolean multiple, String extensionsStr) {
+        runOnUiThread(() -> {
+            try {
+                if ("__fontfolder__".equals(extensionsStr)) {
+                    pcFontTree(id);
+                    return;
+                }
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+""", "the folder request")
+
+fix_source(rel, """        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_OPEN && requestCode != REQ_SAVE) return;
+""", """        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_FONT_TREE) {
+            pcFontTreeResult(resultCode, data);
+            return;
+        }
+        if (requestCode != REQ_OPEN && requestCode != REQ_SAVE) return;
+""", "the folder result")
+
+ANCHOR = """    /** Commit an app-private staged file to its remembered SAF URI; used by Rust after every save. */
+"""
+fix_source(rel, ANCHOR, """    private void pcFontTree(long id) {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        requestIds.put(REQ_FONT_TREE, id);
+        startActivityForResult(intent, REQ_FONT_TREE);
+    }
+
+    private void pcFontTreeResult(int resultCode, Intent data) {
+        Long boxedId = requestIds.remove(REQ_FONT_TREE);
+        if (boxedId == null) return;
+        final long id = boxedId;
+        final Uri tree = data == null ? null : data.getData();
+        if (resultCode != RESULT_OK || tree == null) {
+            enqueueCancel(id, "open");
+            return;
+        }
+        io.execute(() -> {
+            try {
+                File stage = new File(getCacheDir(), "font-folder");
+                pcDeleteTree(stage);
+                JSONArray paths = new JSONArray();
+                String root = android.provider.DocumentsContract.getTreeDocumentId(tree);
+                pcCollectFonts(tree, root, stage, paths, 0);
+                if (paths.length() == 0) {
+                    enqueueError(id, "open", "Aucune police dans ce dossier.");
+                    return;
+                }
+                JSONObject result = base(id, "open", "ok");
+                result.put("paths", paths);
+                results.offer(result.toString());
+            } catch (Exception e) {
+                enqueueError(id, "open", e.toString());
+            }
+        });
+    }
+
+    private void pcDeleteTree(File file) {
+        File[] children = file.listFiles();
+        if (children != null) {
+            for (File child : children) pcDeleteTree(child);
+        }
+        file.delete();
+    }
+
+    /** Every font file and zip under a folder of the document tree, sub-folders included. */
+    private void pcCollectFonts(Uri tree, String parent, File stage, JSONArray paths, int depth) throws Exception {
+        if (depth > 8 || paths.length() >= 5000) return;
+        Uri children = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(tree, parent);
+        String[] columns = {
+            android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE
+        };
+        List<String[]> entries = new ArrayList<>();
+        try (Cursor cursor = getContentResolver().query(children, columns, null, null, null)) {
+            while (cursor != null && cursor.moveToNext()) {
+                entries.add(new String[] { cursor.getString(0), cursor.getString(1), cursor.getString(2) });
+            }
+        }
+        for (String[] entry : entries) {
+            if (android.provider.DocumentsContract.Document.MIME_TYPE_DIR.equals(entry[2])) {
+                pcCollectFonts(tree, entry[0], stage, paths, depth + 1);
+                continue;
+            }
+            String name = entry[1];
+            if (name == null || name.startsWith("._")) continue;
+            String lower = name.toLowerCase(java.util.Locale.ROOT);
+            if (!lower.endsWith(".ttf") && !lower.endsWith(".otf") && !lower.endsWith(".ttc") && !lower.endsWith(".otc") && !lower.endsWith(".zip")) continue;
+            try {
+                File slot = new File(stage, String.valueOf(paths.length()));
+                if (!slot.mkdirs() && !slot.isDirectory()) continue;
+                File out = new File(slot, safeName(name));
+                copyUriToFile(android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, entry[0]), out);
+                paths.put(out.getAbsolutePath());
+            } catch (Exception e) {
+                Log.w(TAG, "Could not read the font " + name, e);
+            }
+        }
+    }
+
+""" + ANCHOR, "the walk of the folder")
+
+if missing:
+    print(f"  Could not patch the font folder for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the font folder for {app}: {', '.join(fixed)}")
+PY
+fi
+
+# --------------------------- 23. a tablet held upright, and no empty settings pages (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+# Upright the screen is about 533 points across. Preferences asked for 170 + 340 and more: its body
+# ran past the dialog and pushed the button row off the screen, while the close box, placed before
+# the body, stayed on. Its columns now fit. Any other dialog wider than the screen scrolls sideways,
+# upright only, so its buttons can always be reached. Lying flat, nothing changes.
+
+D = "crates/ui-egui/src/dialogs.rs"
+fix_source(D, """            ui.disable();
+        }
+        if let Some((size, min, max)) = resizable {
+""", """            ui.disable();
+        }
+        let screen = ctx.content_rect();
+        let upright = cfg!(target_os = "android") && screen.width() < screen.height();
+        let contents = |ui: &mut egui::Ui| -> T {
+            if upright {
+                let room = ui.available_width().min(screen.width() - 72.0);
+                egui::ScrollArea::horizontal().id_salt(id.with("upright")).max_width(room).auto_shrink([resizable.is_none(); 2]).show(ui, contents).inner
+            } else {
+                contents(ui)
+            }
+        };
+        if let Some((size, min, max)) = resizable {
+""", "dialogs scrolling sideways when upright")
+
+P = "crates/ui-egui/src/prefs_ui.rs"
+fix_source(P, """    ui.add_space(6.0);
+    ui.horizontal_top(|ui| {
+        // Section list.
+        ui.vertical(|ui| {
+            ui.set_width(170.0);
+""", """    ui.add_space(6.0);
+    let nav_w = if cfg!(target_os = "android") && ui.available_width() < 560.0 { 124.0 } else { 170.0 };
+    ui.horizontal_top(|ui| {
+        // Section list.
+        ui.vertical(|ui| {
+            ui.set_width(nav_w);
+""", "the section list narrower")
+fix_source(P, "let (rect, resp) = ui.allocate_exact_size(vec2(170.0, 22.0), Sense::click());",
+           "let (rect, resp) = ui.allocate_exact_size(vec2(nav_w, 22.0), Sense::click());", "the section rows")
+fix_source(P, "ui.set_width((ui.available_width() - 12.0).max(340.0));",
+           "ui.set_width((ui.available_width() - 12.0).max(if nav_w < 170.0 { 180.0 } else { 340.0 }));", "the settings column")
+fix_source(P, """egui::ScrollArea::vertical().max_height(content_height - 30.0).id_salt("prefs-scroll")""",
+           """let scroll = if nav_w < 170.0 { egui::ScrollArea::both() } else { egui::ScrollArea::vertical() };
+            scroll.max_height(content_height - 30.0).id_salt("prefs-scroll")""", "the settings scrolling both ways")
+
+# A page saying only that its settings are not available: Scratch Disks, AI Integrations.
+fix_source(P, """    SECTIONS
+        .iter()
+        .copied()
+        .filter(|(id, title)| {
+            query.is_empty()
+""", """    SECTIONS
+        .iter()
+        .copied()
+        .filter(|(id, _)| !cfg!(target_os = "android") || has_visible_fields(values, id))
+        .filter(|(id, title)| {
+            query.is_empty()
+""", "no empty settings pages")
+fix_source("crates/ui-egui/src/menus.rs", """    let mut items: Vec<MenuItem> = crate::menu_catalog::CATALOG
+        .iter()
+        .map(|&(path, label, sc, id)| MenuItem {
+""", """    let mut items: Vec<MenuItem> = crate::menu_catalog::CATALOG
+        .iter()
+        .filter(|(_, _, _, id)| !(cfg!(target_os = "android") && matches!(*id, "edit.preferences.scratchDisks" | "edit.preferences.integrations")))
+        .map(|&(path, label, sc, id)| MenuItem {
+""", "no menu lines to empty pages")
+
+# The last menu title was cut. Upright the mark goes, and the titles sit closer.
+fix_source("crates/ui-egui/src/panels.rs", """                if !system {
+                    let side = if t.pro { 18.0 } else { 20.0 };
+""", """                let upright = cfg!(target_os = "android") && full.width() < ui.ctx().content_rect().height();
+                if !system && !upright {
+                    let side = if t.pro { 18.0 } else { 20.0 };
+""", "no mark in the bar when upright")
+fix_source("crates/ui-egui/src/menus.rs", """            ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
+            nav.bar_bottom = Some(ui.max_rect().bottom());
+""", """            let screen = ui.ctx().content_rect();
+            let side = if cfg!(target_os = "android") && screen.width() < screen.height() { 3.0 } else { 6.0 };
+            ui.spacing_mut().button_padding = egui::vec2(side, 3.0);
+            nav.bar_bottom = Some(ui.max_rect().bottom());
+""", "menu titles closer when upright")
+
+if missing:
+    print(f"  Could not patch the upright layout for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched the upright layout for {app}: {', '.join(fixed)}")
 PY
 fi
