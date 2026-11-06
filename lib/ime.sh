@@ -3126,6 +3126,7 @@ pub fn touch_cutout_bar(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let mode = app.ui.selection_mode;
     let has_selection = app.session.active().is_some_and(|d| d.doc.selection.is_some());
     let can_refine = crate::menus::is_enabled(app, "select.selectAndMask");
+    let has_mask = app.session.active().is_some_and(|d| d.active_layer.and_then(|id| d.doc.layer(id)).is_some_and(|l| l.mask.is_some()));
     let size = app.session.tools.brush.size;
     let frame = egui::Frame::NONE
         .fill(t.dock)
@@ -3165,6 +3166,9 @@ pub fn touch_cutout_bar(app: &mut PhotocraftApp, ctx: &egui::Context) {
                     if touch_cutout_text_button(ui, "Am@E@liorer le contour", can_refine) {
                         action = Some("refine");
                     }
+                    if touch_cutout_text_button(ui, "Inverser", has_selection || has_mask) {
+                        action = Some("invert");
+                    }
                     if touch_cutout_text_button(ui, "Masque", has_selection) {
                         action = Some("mask");
                     }
@@ -3194,6 +3198,18 @@ pub fn touch_cutout_bar(app: &mut PhotocraftApp, ctx: &egui::Context) {
         }
         Some("refine") => {
             if let Err(e) = crate::menus::invoke(app, ctx, "select.selectAndMask", json!({})) {
+                app.ui.status = e;
+                app.ui.status_error = true;
+            }
+        }
+        Some("invert") if has_selection => {
+            if let Err(e) = app.run("select.inverse", json!({})) {
+                app.ui.status = e;
+                app.ui.status_error = true;
+            }
+        }
+        Some("invert") => {
+            if let Err(e) = crate::menus::invoke(app, ctx, "image.adjustments.invert", json!({"target": "mask"})) {
                 app.ui.status = e;
                 app.ui.status_error = true;
             }
