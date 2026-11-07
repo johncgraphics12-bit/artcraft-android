@@ -3800,3 +3800,369 @@ if fixed:
     print(f"  Patched section 24 for {app}: {', '.join(fixed)}")
 PY
 fi
+
+# --------------------------- 25. Layers landing in their board, guides that show, painting and undoing by touch (PhotoCraft)
+if [[ "$APP" == "photocraft" ]]; then
+python3 - "$SRC" "$APP" <<'PY'
+from pathlib import Path
+import sys
+
+src, app = Path(sys.argv[1]), sys.argv[2]
+
+fixed = []
+missing = []
+
+
+def fix_source(rel: str, old: str, new: str, tag: str) -> None:
+    """Replace the single `old` in `rel` with `new`, unless it is already gone or already fixed."""
+    path = src / rel
+    try:
+        text = path.read_text()
+    except OSError:
+        missing.append(f"{rel} (unreadable)")
+        return
+    if new in text:
+        return
+    if text.count(old) != 1:
+        missing.append(f"{rel}: {tag}")
+        return
+    path.write_text(text.replace(old, new, 1))
+    fixed.append(tag)
+
+# ---- New content lands in the board that is selected, as in Photoshop (upstream issue #9147).
+# Only the commands that make something new change: moves, copies and groupings keep insert_above.
+OLD = """    /// Insert `layer` directly below the layer `below` (or at the bottom of the root if None).
+"""
+NEW = """    /// Where new content lands: inside the artboard when the artboard itself is selected, at the
+    /// top of its contents; above the active layer otherwise.
+    pub fn insert_new(&mut self, active: Option<LayerId>, layer: Layer) -> LayerId {
+        let id = layer.id;
+        if layer.artboard().is_none()
+            && let Some(LayerContent::Group(g)) = active.and_then(|a| self.layer_mut(a)).map(|l| &mut l.content)
+            && g.artboard.is_some()
+        {
+            g.children.push(layer);
+            return id;
+        }
+        self.insert_above(active, layer)
+    }
+
+    /// Insert `layer` directly below the layer `below` (or at the bottom of the root if None).
+"""
+fix_source("crates/doc/src/lib.rs", OLD, NEW, "new content landing in its board")
+
+callers = 0
+for path in sorted((src / "crates/engine/src").rglob("*.rs")):
+    code = path.read_text()
+    if "doc.insert_above(*active," in code:
+        path.write_text(code.replace("doc.insert_above(*active,", "doc.insert_new(*active,"))
+        callers += 1
+if callers:
+    fixed.append(f"{callers} commands using it")
+elif not any("doc.insert_new(*active," in p.read_text() for p in (src / "crates/engine/src").rglob("*.rs")):
+    missing.append("no command makes new content with insert_above(*active")
+
+# ---- Guides a finger can reach and an eye can see: light cyan one pixel wide all but vanishes on a
+# white board. On a board a guide runs across that board only, not over the pasteboard.
+R = "crates/ui-egui/src/rulers.rs"
+fix_source(R, "pub const RULER: f32 = 16.0;", 'pub const RULER: f32 = if cfg!(target_os = "android") { 28.0 } else { 16.0 };', "rulers for a finger")
+fix_source(R, "    let tol = 4.0 / app.point_zoom().max(0.01) as f64;\n", '    let tol = if cfg!(target_os = "android") { 16.0 } else { 4.0 } / app.point_zoom().max(0.01) as f64;\n', "guides for a finger")
+OLD = """    let line = |vertical: bool, pos: f64, color: Color32| {
+        let [a, b] = guide_segment(xf, clip, vertical, pos);
+        styled_line(painter, a, b, Stroke::new(1.0, color), style);
+    };
+"""
+NEW = """    let android = cfg!(target_os = "android");
+    let stroke = |a: Pos2, b: Pos2, color: Color32| {
+        if android {
+            painter.line_segment([a, b], Stroke::new(3.0, Color32::from_black_alpha(110)));
+        }
+        styled_line(painter, a, b, Stroke::new(if android { 1.5 } else { 1.0 }, color), style);
+    };
+    let full = |vertical: bool, pos: f64, color: Color32| {
+        let [a, b] = guide_segment(xf, clip, vertical, pos);
+        stroke(a, b, color);
+    };
+    let boards: Vec<_> = if android { doc.artboards().iter().map(|b| b.2.rect).collect() } else { Vec::new() };
+    let line = |vertical: bool, pos: f64, color: Color32| {
+        let across = |lo: i32, hi: i32| f64::from(lo) <= pos && pos <= f64::from(hi);
+        let holding: Vec<_> = boards.iter().filter(|r| if vertical { across(r.x0, r.x1) } else { across(r.y0, r.y1) }).collect();
+        if holding.is_empty() {
+            full(vertical, pos, color);
+        }
+        for r in holding {
+            let at = pos as f32;
+            let (a, b) = if vertical {
+                (xf.to_screen(at, r.y0 as f32), xf.to_screen(at, r.y1 as f32))
+            } else {
+                (xf.to_screen(r.x0 as f32, at), xf.to_screen(r.x1 as f32, at))
+            };
+            stroke(a, b, color);
+        }
+    };
+"""
+fix_source(R, OLD, NEW, "guides that show on a board")
+OLD = "        line(d.vertical, d.pos, d.index.and_then(|i| list.get(i)).map_or(guide, |p| own(d.vertical, *p)));\n"
+NEW = "        full(d.vertical, d.pos, d.index.and_then(|i| list.get(i)).map_or(guide, |p| own(d.vertical, *p)));\n"
+fix_source(R, OLD, NEW, "a dragged guide shown whole")
+
+# ---- A layer moved on the canvas joins the board it lands on, and leaves the one it left (Photoshop).
+M = "crates/ui-egui/src/move_ui.rs"
+OLD = """    let Some(p) = shown else { return };
+    crate::canvas::shown_as_document(app, p.doc, is_preview_key);
+}
+"""
+NEW = """    if let Some(p) = shown {
+        crate::canvas::shown_as_document(app, p.doc, is_preview_key);
+    }
+    nest_on_board(app);
+}
+
+/// The one layer just moved joins the board under its centre, or leaves the board it came out of.
+fn nest_on_board(app: &mut PhotocraftApp) {
+    if !cfg!(target_os = "android") {
+        return;
+    }
+    let Some(st) = app.session.active() else { return };
+    if !st.doc.has_artboards() {
+        return;
+    }
+    let picked = st.selected_layers();
+    let [id] = picked[..] else { return };
+    let Some(layer) = st.doc.layer(id).filter(|l| l.artboard().is_none()) else { return };
+    let bounds = photocraft_compose::layer_bounds(layer, st.doc.bounds());
+    if bounds.is_empty() {
+        return;
+    }
+    let (x, y) = ((i64::from(bounds.x0) + i64::from(bounds.x1)) / 2, (i64::from(bounds.y0) + i64::from(bounds.y1)) / 2);
+    let under = st.doc.artboards().iter().find_map(|b| {
+        let r = b.2.rect;
+        (i64::from(r.x0) <= x && x < i64::from(r.x1) && i64::from(r.y0) <= y && y < i64::from(r.y1)).then_some(b.0)
+    });
+    let from = st.doc.artboard_of(id);
+    let step = match (under, from) {
+        (Some(to), from) if from != Some(to) => Some((to, "into")),
+        (None, Some(from)) => Some((from, "above")),
+        _ => None,
+    };
+    if let Some((target, position)) = step {
+        let _ = app.run("layer.moveTo", json!({"layer": id.0, "target": target.0, "position": position}));
+    }
+}
+"""
+fix_source(M, OLD, NEW, "a moved layer joining its board")
+
+# ---- The brush always has somewhere to paint, and says so when it cannot. The refused stroke used
+# to end in silence: the board itself, a group, type or a shape took nothing and showed nothing.
+C = "crates/ui-egui/src/canvas.rs"
+OLD = """            crate::paint_mouse::sync_tool_brush(app);
+            // Clear mode (`~` held, or chosen in the options bar) erases with the tool's own brush.
+"""
+NEW = """            if cfg!(target_os = "android") && strokes_live(tool) {
+                make_room_to_paint(app, tool);
+            }
+            crate::paint_mouse::sync_tool_brush(app);
+            // Clear mode (`~` held, or chosen in the options bar) erases with the tool's own brush.
+"""
+fix_source(C, OLD, NEW, "a stroke finding its layer")
+
+# ---- Two fingers belong to the view: a second finger takes back the dab the first one just made,
+# and a quick tap undoes (three fingers redo), as in the tablet painting apps.
+OLD = """        let mut buttons = crate::paint_mouse::canvas_buttons(app, &response, tool);
+"""
+NEW = """        let mut buttons = crate::paint_mouse::canvas_buttons(app, &response, tool);
+        let chord = touch_chord(app, &ctx, &response);
+        if chord {
+            let young = ui.input(|i| i.pointer.press_start_time().is_some_and(|t| i.time - t < 0.5));
+            if young && app.drag.as_ref().is_some_and(|d| strokes_live(d.tool)) {
+                app.drag = None;
+                app.live_stroke = None;
+                app.press_stroke = false;
+            }
+            if app.drag.is_none() {
+                (buttons.started, buttons.dragged, buttons.clicked) = (false, false, false);
+            }
+        }
+"""
+fix_source(C, OLD, NEW, "two fingers leaving no dab")
+OLD = """        if strokes_live(tool)
+            && !right_down
+"""
+NEW = """        if strokes_live(tool)
+            && !chord
+            && !right_down
+"""
+fix_source(C, OLD, NEW, "no stroke under two fingers")
+OLD = """/// Render the drag points the live stroke hasn't seen yet, with the pen pressure, tilt and
+"""
+NEW = r"""/// A press of several fingers on the canvas, followed until the last one lifts.
+#[derive(Clone, Copy, Default)]
+struct TouchChord {
+    fingers: usize,
+    moved: f32,
+    began: f64,
+    on_canvas: bool,
+}
+
+/// Whether several fingers are on the screen, or the last of them has just lifted. A quick tap that
+/// hardly moved is Undo with two fingers and Redo with three.
+fn touch_chord(app: &mut PhotocraftApp, ctx: &egui::Context, response: &egui::Response) -> bool {
+    if !cfg!(target_os = "android") {
+        return false;
+    }
+    let id = egui::Id::new("pc-touch-chord");
+    let held: Option<TouchChord> = ctx.data(|d| d.get_temp(id));
+    let (multi, touching, now) = ctx.input(|i| (i.multi_touch(), i.any_touches(), i.time));
+    let started = multi.as_ref().map(|m| TouchChord { fingers: m.num_touches, moved: 0.0, began: now, on_canvas: response.contains_pointer() });
+    let Some(mut chord) = held.or(started) else { return false };
+    if let Some(m) = &multi {
+        chord.fingers = chord.fingers.max(m.num_touches);
+        chord.moved += m.translation_delta.length() + (m.zoom_delta - 1.0).abs() * 200.0;
+    }
+    if touching {
+        ctx.data_mut(|d| d.insert_temp(id, chord));
+        return true;
+    }
+    ctx.data_mut(|d| d.remove_temp::<TouchChord>(id));
+    if chord.on_canvas && now - chord.began < 0.45 && chord.moved < 16.0 && app.drag.is_none() {
+        let command = match chord.fingers {
+            2 => Some("edit.undo"),
+            3 => Some("edit.redo"),
+            _ => None,
+        };
+        if let Some(command) = command.filter(|c| crate::menus::is_enabled(app, c))
+            && let Err(e) = crate::menus::invoke(app, ctx, command, json!({}))
+        {
+            app.ui.status = e;
+            app.ui.status_error = true;
+        }
+    }
+    true
+}
+
+/// Before a stroke: the Brush and the Pencil get a new layer when the active one takes no paint (a
+/// board, a group, type, a shape); every painting tool says why a locked layer refuses it.
+fn make_room_to_paint(app: &mut PhotocraftApp, tool: Tool) {
+    if !app.session.is_enabled("paint.stroke") {
+        if !matches!(tool, Tool::Brush | Tool::Pencil) {
+            app.ui.status = "Choisis d'abord un calque de pixels.".into();
+            app.ui.status_error = true;
+            return;
+        }
+        let group = app.session.active().and_then(|st| {
+            let id = st.active_layer?;
+            st.doc.layer(id).filter(|l| l.is_group() && l.artboard().is_none()).map(|_| id)
+        });
+        let Ok(made) = app.run("layer.new.layer", json!({})) else { return };
+        if let (Some(group), Some(layer)) = (group, made.get("layer").and_then(serde_json::Value::as_u64)) {
+            let _ = app.run("layer.moveTo", json!({"layer": layer, "target": group.0, "position": "into"}));
+        }
+        app.ui.status = "Nouveau calque cr\u{e9}\u{e9} pour peindre.".into();
+        app.ui.status_error = false;
+        return;
+    }
+    let locked = !app.ui.mask_target
+        && app.session.active().is_some_and(|st| {
+            st.active_layer.is_some_and(|id| {
+                let locks = st.doc.effective_locks(id);
+                locks.pixels || locks.all
+            })
+        });
+    if locked {
+        app.ui.status = "Ce calque est verrouill\u{e9} : d\u{e9}verrouille-le pour peindre.".into();
+        app.ui.status_error = true;
+    }
+}
+
+/// Render the drag points the live stroke hasn't seen yet, with the pen pressure, tilt and
+"""
+fix_source(C, OLD, NEW, "the chord and the stroke's layer")
+
+# ---- Brush size and opacity under the thumb, without opening a panel.
+P = "crates/ui-egui/src/panels.rs"
+OLD = """#[cfg(test)]
+mod symmetry_theme_tests {
+"""
+NEW = r"""/// Size and opacity over the canvas while a painting tool is active (Android).
+pub fn touch_paint_bar(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    let tool = app.ui.tool;
+    let canvas = app.last_canvas_rect;
+    let shown = cfg!(target_os = "android")
+        && app.ui.docking.is_none()
+        && app.ui.dialogs.is_empty()
+        && app.ui.transform.is_none()
+        && app.drag.is_none()
+        && canvas.is_positive()
+        && app.session.active().is_some()
+        && matches!(tool, Tool::Brush | Tool::Pencil | Tool::Eraser);
+    if !shown {
+        return;
+    }
+    crate::paint_mouse::sync_tool_brush(app);
+    let before = app.session.tools.brush.clone();
+    let (size, opacity) = (before.size, before.opacity);
+    let t = Tokens::get(ctx);
+    let frame = egui::Frame::NONE
+        .fill(t.dock)
+        .stroke(Stroke::new(1.0, t.card_border))
+        .corner_radius(CornerRadius::same(t.radius_lg as u8))
+        .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: t.shadow })
+        .inner_margin(egui::Margin::same(6));
+    let mut brush = before.clone();
+    let area = egui::Area::new(egui::Id::new("touch-paint-area"))
+        .order(egui::Order::Middle)
+        .pivot(Align2::CENTER_BOTTOM)
+        .fixed_pos(pos2(canvas.center().x, canvas.bottom() - 12.0))
+        .show(ctx, |ui| {
+            frame.show(ui, |ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                ui.horizontal(|ui| {
+                    let value = |ui: &mut egui::Ui, text: String, width: f32| {
+                        let (rect, _) = ui.allocate_exact_size(vec2(width, 44.0), Sense::hover());
+                        ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, theme::medium(13.0), t.text);
+                    };
+                    value(ui, "Taille".to_string(), 44.0);
+                    if icons::button_with_icon_size(ui, "minus", 44.0, 20.0, false, "").clicked() {
+                        brush.size = (size * 0.8).max(1.0);
+                    }
+                    value(ui, format!("{size:.0}"), 40.0);
+                    if icons::button_with_icon_size(ui, "plus", 44.0, 20.0, false, "").clicked() {
+                        brush.size = (size * 1.25).max(size + 1.0).min(5000.0);
+                    }
+                    ui.add_space(8.0);
+                    value(ui, "Opacit\u{e9}".to_string(), 52.0);
+                    if icons::button_with_icon_size(ui, "minus", 44.0, 20.0, false, "").clicked() {
+                        brush.opacity = (((opacity * 10.0).round() - 1.0) / 10.0).clamp(0.1, 1.0);
+                    }
+                    value(ui, format!("{:.0} %", opacity * 100.0), 48.0);
+                    if icons::button_with_icon_size(ui, "plus", 44.0, 20.0, false, "").clicked() {
+                        brush.opacity = (((opacity * 10.0).round() + 1.0) / 10.0).clamp(0.1, 1.0);
+                    }
+                });
+            });
+        });
+    let lift = area.response.rect.height() + 8.0;
+    ctx.data_mut(|d| d.insert_temp(touch_cutout_lift_id(), lift));
+    if brush.size != size || brush.opacity != opacity {
+        crate::brush_panel::commit_gesture(app, ctx, &before, &brush);
+    }
+}
+
+#[cfg(test)]
+mod symmetry_theme_tests {
+"""
+fix_source(P, OLD, NEW, "the paint bar")
+OLD = """        layers_panel_ui::show_dialog(self, &ctx);
+"""
+NEW = """        panels::touch_paint_bar(self, &ctx);
+        layers_panel_ui::show_dialog(self, &ctx);
+"""
+fix_source("crates/ui-egui/src/lib.rs", OLD, NEW, "the paint bar drawn over the canvas")
+
+if missing:
+    print(f"  Could not patch section 25 for {app}: {'; '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+if fixed:
+    print(f"  Patched section 25 for {app}: {', '.join(fixed)}")
+PY
+fi
